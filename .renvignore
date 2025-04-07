@@ -1,0 +1,26 @@
+# ignore python notebooks
+*.ipynb
+
+# ignore python files
+*.py
+
+# ignore python env files
+*.yaml
+*.yml
+
+# ignore data
+data/
+
+# ignore archived notebooks
+notebooks/archive
+
+# ignore outputs
+calibrations/
+images/
+models_output/
+simulations/
+videos/
+
+# ignore caches
+cache/
+.ipynb_checkpoints/

@@ -1,0 +1,1493 @@
+---
+title: "MCMC Calibration"
+format: html
+editor: visual
+---
+
+# Environment Setup
+
+```{r setup}
+# GDAL setup
+Sys.setenv(PROJ_LIB = "/opt/homebrew/Cellar/proj/9.5.0/share/proj")
+
+# Packages
+library(rprojroot)
+library(tidyverse)
+library(sf)
+library(pomp)
+library(foreach)
+library(doParallel)
+library(doRNG)
+library(patchwork)
+
+# Set Random Seed
+nb_name <-  "Cholera modelling with compartmental models and pomp"
+seed <- sum(sapply(str_split(nb_name, pattern = "", simplify = TRUE), FUN = utf8ToInt))
+
+# Parallel Computing
+n_cores <- parallel::detectCores()
+registerDoParallel(n_cores)
+registerDoRNG(seed)
+
+# Folder Structure
+root <- has_file("Oxford-Cholera.Rproj")$make_fix_file()
+raw_data_dir <- root("data/raw")
+proc_data_dir <- root("data/processed")
+output_dir <- root("models_output/pomp")
+dir.create(output_dir, showWarnings = FALSE)
+```
+
+# Functions
+
+```{r}
+scale01 <- function (x) {
+  (x - min(x)) / max(x - min(x))
+}
+```
+
+# Import Data
+
+```{r}
+df_uvira_pop <- st_read(file.path(proc_data_dir, "uvira_quarters_pop_2016.geojson"))
+
+df_chol <- (
+  read_csv(
+    file.path(proc_data_dir, "uvira_full_data.csv", fsep = "/"),
+    show_col_types = FALSE
+  )
+)
+```
+
+```{r}
+plot(
+  df_chol$date, 
+  df_chol$reports, 
+  type = "l", 
+  col = "black",
+  xlab = "Date",
+  ylab = "# Reported Cases", 
+  main = "Cholera Outbreak in Uvira"
+)
+```
+
+# Parameters
+
+```{r}
+# N_0 <- 280000  # Initial population size
+N_0 <- sum(df_uvira_pop$population)
+TIME_BIN <- 7            # Time bin in days
+BIRTH_RATE <- (42/1000)  * (1 / 365.25)        # Births per person per week
+NATURAL_DEATH_RATE <- (9/1000) * (1 / 365.25)  # Deaths per person per week
+```
+
+# Computational Parameters
+
+```{r}
+run_level <- 2
+chol_Np <- switch(run_level, 100, 1e3, 5e3)
+chol_Nmif <- switch(run_level, 10, 100, 200)
+chol_Nreps_eval <- switch(run_level, 2, 10, 20)
+chol_Nreps_local <- switch(run_level, 10, 20, 40)
+chol_Nreps_global <- switch(run_level, 20, 40, 100)
+chol_Nsim <- switch(run_level, 50, 100, 500)
+```
+
+# Preprocess Data
+
+```{r}
+df_reports <- (
+  df_chol
+  %>% filter(
+    date >= "2016-06-05",  # We select data from before the start of an outbreak
+    date <= "2021-12-31"
+  )
+  %>% mutate(
+    reports = reports # We set the off-outbreak to zero for now
+  )
+  %>% group_by(
+    date = as.Date(cut(date, breaks = "week", start.on.monday = FALSE))
+  )
+  %>% summarise(
+    reports = sum(reports),
+    rainfall_mm = sum(rainfall_mm),
+    ssm = mean(ssm),
+    lake_level = mean(lake_level)
+  )
+  %>% mutate(
+    reports = cumsum(reports),
+    cov_mult = scale(scale01(rainfall_mm) * scale01(ssm) * scale01(lake_level)),
+    cov_add = scale(scale01(rainfall_mm) + scale01(ssm) + scale01(lake_level))
+  )
+)
+
+
+df_reports_single_outbreak <- (
+  df_reports
+  %>% filter(
+    date <= "2016-12-15"
+  )
+  %>% mutate(
+    date = seq(1, n(), by = 1)
+    # date=(julian(date,origin=as.Date("1950-01-01")))/365.25+1950,
+  )
+)
+```
+
+```{r}
+plot(df_reports_single_outbreak$date, df_reports_single_outbreak$reports, type = "l", col = "black")
+```
+
+```{r}
+plot(df_reports_single_outbreak$date, df_reports_single_outbreak$cov_add, type = "l", col = "black")
+```
+
+```{r}
+plot(df_reports_single_outbreak$date, df_reports_single_outbreak$ssm ** 2, type = "l", col = "black")
+```
+
+# Models
+
+## SIR
+
+### Initialization Function
+
+```{r}
+# sir_rinit <- function (X, eta, N, ...) {
+#   X[["I"]] <- 1
+#   X[["S"]] <- round((N - X[["I"]]) * eta)
+#   X[["R"]] <- N - X[["S"]] - X[["I"]]
+#   X[["H"]] <- 0
+#   
+#   return(X)
+# }
+
+# sir_rinit_c <- Csnippet("
+  # int N = 0;
+  #   for(int i = 0; i < n; i++) {
+  #     N += X[i];
+  # }
+#   X[1] = I_init;
+#   X[0] = nearbyint((N - X[1]) * eta);
+#   X[2] = N - X[1] - X[0];
+#   X[3] = 0;
+# ")
+
+sir_rinit <- Csnippet("
+  I = I_init;
+  S = nearbyint((N - I) * eta);
+  R = N - I - S;
+  H = 0;
+")
+```
+
+### Step Function
+
+```{r}
+# Single Step Function
+# sir_step <- function (X, betas, delta.t, ...) {
+#   dSI <- rbinom(n = 1, size = X[["S"]], prob = (1 - exp(-delta.t * betas[["b_si"]] * X[["I"]] / sum(X))))
+#   dIR <- rbinom(n = 1, size = X[["I"]], prob = (1 - exp(-delta.t * betas[["b_ir"]])))
+#   X[["S"]] <- S - dSI
+#   X[["I"]] <- I + dSI - dIR
+#   X[["R"]] <- R + dIR
+#   X[["H"]] <- H + dIR # Observation variable
+#   
+#   return(X)
+# }
+
+# sir_step_c <- Csnippet("
+#   int N = 0;
+#   for(int i = 0; i < n; i++) {
+#     N += X[i];
+#   }
+#   double dSI = rbinom(X[0], 1 - exp(-(dt * betas[0] * X[1]) / N));
+#   double dIR = rbinom(X[1], 1 - exp(-dt * betas[1]));
+#   X[0] -= dSI;
+#   X[1] += dSI - dIR;
+#   X[2] += dIR;
+#   X[3] += dIR;
+# ")
+
+sir_step <- Csnippet("
+  int N_t = S + I + R;  
+  double dSI = rbinom(S, 1 - exp(-(dt * Beta * I) / N_t));
+  double dIR = rbinom(I, 1 - exp(-dt * mu_ir));
+  S -= dSI;
+  I += dSI - dIR;
+  R += dIR;
+  H += dIR;
+")
+```
+
+### Observation Function
+
+```{r}
+# sir_dmeas <- function (reports, X, rho, log, ...) {
+#   dbinom(
+#     x = reports,
+#     size = X[["H"]],
+#     prob = rho,
+#     log = log
+#   )
+# }
+
+# sir_dmeas_c <- Csnippet("
+#   lik = dbinom(
+#     reports,
+#     X[3],
+#     rho,
+#     give_log
+#   );
+# ")
+
+# reports is the name of the observed variable in the dataset
+sir_dmeas <- Csnippet("
+  lik = dbinom(reports, H, rho, give_log);
+")
+
+# sir_rmeas <- function (X, rho, ...) {
+#   c(reports = rbinom(n = 1, size = X[["H"]], prob = rho)) 
+# }
+
+# sir_rmeas_c <- Csnippet("
+#   reports = rbinom(X[3], rho);
+# ")
+sir_rmeas <- Csnippet("
+  reports = rbinom(H, rho);
+")
+```
+
+### Single outbreak modeling
+
+#### pomp object
+
+```{r}
+measSIR <- (
+  df_reports_single_outbreak
+  %>% pomp(
+    times = "date",
+    t0 = 1,
+    rprocess = euler(
+      step.fun = sir_step,
+      delta.t = 1/7
+    ),
+    rinit = sir_rinit,
+    rmeasure = sir_rmeas,
+    dmeasure = sir_dmeas,
+    accumvars="H",
+    statenames = c("S", "I", "R", "H"),
+    paramnames = c("Beta", "mu_ir", "N", "I_init", "eta", "rho")
+  )
+)
+```
+
+#### Parameter estimation
+
+```{r}
+R0 <- 1.15
+tot_reported <- sum(df_reports_single_outbreak$reports)
+
+I_init_guess <- 100
+rho_guess <- 0.02
+tot_infected <- tot_reported / rho_guess
+eta_guess <- tot_infected / N
+mu_ir_guess <- 7/5  # inverse of infectious period in weeks (?)
+Beta_guess <- 18 #b_ir_guess * R0
+```
+
+#### Simulations
+
+```{r}
+sims <- (
+  measSIR
+  %>% simulate(
+    params=c(
+      Beta = Beta_guess,
+      mu_ir = mu_ir_guess,
+      N = N,
+      I_init = I_init_guess,
+      eta = eta_guess,
+      rho = rho_guess
+    ),
+    nsim = 20,
+    format = "data.frame",
+    include.data = TRUE
+  )
+)
+```
+
+```{r}
+(
+  sims
+  %>% ggplot(
+    aes(x = date, y = reports, group=.id, color=.id=="data")
+  )
+  + geom_line()
+  + guides(color = "none")
+)
+```
+
+## SEIR
+
+### Initialization Function
+
+```{r}
+seir_rinit <- Csnippet("
+  E = E_init;
+  I = I_init;
+  S = nearbyint((N - E - I - R_init) * eta);
+  R = N - E - I - S - R_init;
+  H = R_init;
+")
+```
+
+### Step Function
+
+```{r}
+seir_rproc <- Csnippet("
+  int N_t = S + E + I + R;  
+  double dSE = rbinom(S, 1 - exp(-(dt * Beta * I) / N_t));
+  double dEI = rbinom(E, 1 - exp(-dt * mu_latend));
+  double dIR = rbinom(I, 1 - exp(-dt * mu_ir));
+  S -= dSE;
+  E += dSE - dEI;
+  I += dEI - dIR;
+  R += dIR;
+  H += dIR;
+")
+```
+
+### Observation Function
+
+```{r}
+# reports is the name of the observed variable in the dataset
+# seir_dmeas <- Csnippet("
+#   double ll = dbinom(reports, H, rho, give_log);
+#   lik = (!isfinite(ll) ? -1000 : ll );
+# ")
+seir_dmeas <- Csnippet("
+  lik = dbinom(reports, H, rho, give_log);
+")
+
+# seir_dmeas  <- function(reports,H,rho,log, ...) {
+#     lik <- dbinom(reports,size=H,prob=rho,log=log)
+    # if (!is.finite(lik)) {
+    #     lik <- -1000
+    #     browser()
+    # }
+#     return(lik)
+# }
+
+seir_rmeas <- Csnippet("
+  reports = rbinom(H, rho);
+")
+```
+
+### Single outbreak modeling
+
+#### pomp object
+
+```{r}
+measSEIR <- (
+  df_reports_single_outbreak
+  %>% pomp(
+    times = "date",
+    t0 = 0,
+    rprocess = euler(
+      step.fun = seir_rproc,
+      delta.t = 1/7
+    ),
+    rinit = seir_rinit,
+    rmeasure = seir_rmeas,
+    dmeasure = seir_dmeas,
+    accumvars="H",
+    statenames = c("S", "E", "I", "R", "H"),
+    paramnames = c("Beta", "mu_latend", "mu_ir", "N", "E_init", "I_init", "R_init", "eta", "rho")
+  )
+)
+```
+
+#### Initial parameter estimates
+
+```{r}
+R0 <- 1.15
+tot_reported <- sum(df_reports_single_outbreak$reports)
+
+E_init_guess <- 100
+I_init_guess <- 1500
+R_init_guess <- df_reports_single_outbreak$reports[1]
+rho_guess <- 0.004
+tot_infected <- tot_reported / rho_guess
+eta_guess <- 0.8 #tot_infected / N
+mu_latend_guess <- 7/5
+mu_ir_guess <- 7/10   # inverse of infectious period
+Beta_guess <- 2 #b_ir_guess * R0
+```
+
+#### Simulations
+
+```{r}
+sims_seir <- (
+  measSEIR
+  %>% simulate(
+    params=c(
+      Beta = Beta_guess,
+      mu_ir = mu_ir_guess,
+      mu_latend = mu_latend_guess,
+      N = N,
+      E_init = E_init_guess,
+      I_init = I_init_guess,
+      R_init = R_init_guess,
+      eta = eta_guess,
+      rho = rho_guess
+    ),
+    nsim = 20,
+    format = "data.frame",
+    include.data = TRUE
+  )
+)
+```
+
+```{r}
+(
+  sims_seir
+  %>% ggplot(
+    aes(x = date, y = reports, group=.id, color=.id=="data")
+  )
+  + geom_line()
+  + guides(color = "none")
+)
+```
+
+```{r}
+measSEIR <- (
+  measSEIR
+  %>% pomp(
+    params=c(
+      Beta = Beta_guess,
+      mu_ir = mu_ir_guess,
+      mu_latend = mu_latend_guess,
+      N = N,
+      E_init = E_init_guess,
+      I_init = I_init_guess,
+      R_init = R_init_guess,
+      eta = eta_guess,
+      rho = rho_guess
+    )
+  )
+)
+```
+
+#### Likelihood checks
+
+```{r}
+lik_slice_design <- slice_design(
+  center=coef(measSEIR),
+  Beta = rep(seq(from=1, to=30, length=40), each=3),
+  mu_ir = rep(seq(from=0.7, 1.5, length=40), each=3),
+  E_init = rep(seq(from=0, 1500, by=50), each=3),
+  I_init = rep(seq(from=0, 1500, by=50), each=3)
+)
+```
+
+```{r}
+plot(lik_slice_design)
+```
+
+```{r}
+lik_slice <- foreach (theta=iter(lik_slice_design, "row"), .combine=rbind, .inorder=FALSE) %dopar% {
+  pf <- measSEIR %>% pfilter(params = theta, Np = 5000)
+  theta$loglik <- logLik(pf)
+  theta
+}
+```
+
+```{r}
+p1 <- (
+  lik_slice
+  %>% filter(slice == "Beta")
+  %>% ggplot(
+    aes(x = Beta, y = loglik)
+  )
+  + geom_point()
+)
+p2 <- (
+  lik_slice
+  %>% filter(slice == "mu_ir")
+  %>% ggplot(
+    aes(x = mu_ir, y = loglik)
+  )
+  + geom_point()
+)
+p3 <- (
+  lik_slice
+  %>% filter(slice == "E_init")
+  %>% ggplot(
+    aes(x = E_init, y = loglik)
+  )
+  + geom_point()
+)
+p4 <- (
+  lik_slice
+  %>% filter(slice == "I_init")
+  %>% ggplot(
+    aes(x = I_init, y = loglik)
+  )
+  + geom_point()
+)
+(p1 + p2) / (p3 + p4)
+```
+
+#### Iterated Particle Filter
+
+```{r}
+# Test single filter first
+test_pfilter <- (
+  measSEIR
+  %>% pfilter(Np = 1000)
+)
+```
+
+```{r}
+plot(test_pfilter)
+```
+
+```{r}
+fixed_params <- c(
+  N=N, 
+  # E_init=E_init_guess,
+  # I_init=I_init_guess,
+  R_init=df_reports_single_outbreak$reports[1],
+  mu_latend=mu_latend_guess,
+  mu_ir=mu_ir_guess
+)
+```
+
+##### Fixed parameters
+
+```{r}
+coef(measSEIR, names(fixed_params)) <- unname(fixed_params)
+```
+
+##### Iterated Particle Filter - Local Search
+
+```{r}
+# Parameters 
+num_runs <- 20
+num_particles <- 2000
+num_iter <- 100
+cooling_fraction <- 0.5 # Level of parameter variance after 50% of iterations
+init_sd <- 0.03        # SD for parameters on log scale
+
+mifs_local_seir <- foreach (
+  i=1:num_runs, 
+  .combine=c 
+  # .packages=c("dplyr", "pomp")
+) %dopar% {
+  (
+    measSEIR 
+    %>% mif2(
+      Np=num_particles,
+      Nmif=num_iter,
+      cooling.fraction.50 = cooling_fraction,
+      rw.sd=rw_sd(
+        Beta=init_sd,
+        # E_init=int(ivp(init_sd)),  # ivp tells the algorithm that all the info for these parameters are set only at the very beginning
+        # I_init=int(ivp(init_sd)),
+        eta=ivp(init_sd),
+        rho=init_sd
+      ),
+      partrans=parameter_trans(
+        log=c("Beta"),
+        logit=c("eta", "rho")
+      ),
+      paramnames=c(
+        "Beta", 
+        # "E_init", 
+        # "I_init", 
+        "eta", 
+        "rho"
+      )
+    )
+  )
+}
+```
+
+##### Diagnostics
+
+```{r}
+(
+  mifs_local_seir
+  %>% traces()
+  %>% melt()
+  %>% ggplot(
+    aes(
+      x=iteration,
+      y=value,
+      group=.L1,
+      color=factor(.L1)
+    )
+  )
+  + geom_line()
+  + guides(color="none")
+  + facet_wrap(~name, scales="free_y")
+)
+```
+
+```{r}
+# We can set different starting points for the local exploration
+
+Beta_guesses <- runif(400, min = 10, max = 150)
+rho_guesses <- runif(400, min=0.01, max=0.3)
+eta_guesses <- runif(400, min=0, max=0.1)
+E_init_guesses <- sample(seq(0, 1000, by = 50), size = 400, replace=TRUE)
+I_init_guesses <- sample(seq(0, 1000, by = 50), size = 400, replace=TRUE)
+
+guesses <- as.data.frame(cbind(
+  Beta = Beta_guesses,
+  rho = rho_guesses,
+  eta = eta_guesses,
+  E_init = E_init_guesses,
+  I_init = I_init_guesses
+))
+# 
+# guesses <- runif_design(
+#   lower=c(Beta=1.05, rho=0.01, eta=0),
+#   upper=c(Beta=25, rho=0.99, eta=0.99),
+#   nseq=400
+# )
+
+# guesses <- (
+#   slice_design(
+#     center=coef(measSEIR),
+#     Beta = seq(from=1, to=30, length.out=40),
+#     E_init = seq(from=0, 1500, by=50),
+#     I_init = seq(from=0, 1500, by=50),
+#     rho = seq(from=0.01, to=0.99, length.out=40),
+#     eta = seq(from=0, to=0.99, length.out=40)
+#   )
+#   %>% select(-slice)
+# )
+```
+
+```{r}
+# Recycle previously run object
+mf1 <- mifs_local_seir[[1]]
+```
+
+```{r}
+results <- foreach (guess=iter(guesses, "row"), .combine=rbind) %dopar% {
+  mf <- (
+    mf1
+    %>% mif2(params=c(unlist(guess), fixed_params))
+    %>% mif2(Nmif=100)
+  )
+  ll <- (
+    replicate(
+      10,
+      (
+        mf 
+        %>% pfilter(Np=5000)
+        %>% logLik()
+      )
+    )
+    %>% logmeanexp(se=TRUE)
+  )
+  (
+    mf
+    %>% coef()
+    %>% bind_rows()
+    %>% bind_cols(
+      loglik=ll[1],
+      loglik.se=ll[2]
+    )
+  )
+}
+      
+```
+
+```{r}
+results %>% write_csv(file.path(proc_data_dir, "test_mif_20250216.csv"), append = TRUE)
+```
+
+```{r}
+results
+```
+
+```{r}
+test_results <- read_csv(file.path(proc_data_dir, "test_mif_20250216.csv"))
+```
+
+```{r}
+results_to_plot <- (
+  results
+  %>% filter(loglik>max(loglik) - 300)
+  %>% bind_rows(guesses)
+  %>% mutate(
+    type = if_else(is.na(loglik), "guess", "result")
+  )
+  %>% arrange(type)
+)
+```
+
+```{r}
+pairs(
+  ~loglik+Beta+E_init+I_init+eta+rho,
+  data = results_to_plot,
+  pch=16,
+  cex=0.3,
+  col=ifelse(results_to_plot$type == "guess", grey(0.5), "red")
+)
+```
+
+## SEAITR
+
+We don't consider births and deaths for the modeling of a single peak. Nor we consider return to the susceptible compartment
+
+### Save File
+
+```{r}
+seaitr_filename <- file.path(output_dir, "chol_seaitr.csv")
+```
+
+### Initialization Function
+
+```{r}
+seaitr_rinit <- Csnippet("
+  N = N_0;
+  H = H_0;
+  double I_0 = fmin(nearbyint(H_0 / (1 - exp(-mu_ih))), N_0);
+  I = I_0;
+  double A_0 = fmin(nearbyint(f_ai/(1 - f_ai) * I_0), N_0);
+  A = A_0;
+  double E_0 = fmin(nearbyint((A_0 + I_0) / (1 - exp(-mu_latend))), N_0);
+  E = E_0;
+  double m = (N_0 - E_0 - A_0 - I_0 - H_0);
+  S = nearbyint(m*s_0);
+  R = nearbyint(m*(1 - s_0));
+  W = 0;
+")
+
+```
+
+### Step Function
+
+```{r}
+seaitr_rproc <- Csnippet("
+  double foi, dw, births;
+  double rate[14];
+  double trans[14];
+  
+  // Poisson births
+  births = rpois(mu_b * N * dt);
+  
+  // Poisson immigration
+  // imm = rpois(N * iota * dt); 
+
+  // expected force of infection
+  foi = Beta*pow((I + eps * A),alpha)/N;
+  
+  // white noise (extrademographic stochasticity)
+  dw = rgammawn(sigmaSE,dt);
+
+  rate[0] = foi*dw/dt;  // stochastic force of infection
+  rate[1] = mu_d;        // natural death rate
+  rate[2] = mu_latend * f_ai;      // transition to asymp
+  rate[3] = mu_latend * (1 - f_ai); // transition to symp
+  rate[4] = mu_d;        // natural death rate
+  rate[5] = mu_ar;       // asymp -> recovery
+  rate[6] = mu_d;        // natural death rate
+  rate[7] = mu_ih;       // symp -> hospitalized
+  rate[8] = mu_ir;       // symp -> recovered
+  rate[9] = mu_d;        // natural death rate
+  rate[10] = mu_hr;       // hospitalized -> recovered
+  rate[11] = mu_d;        // natural death rate
+  rate[12] = mu_rs;       // recovered -> susceptible
+  rate[13] = mu_d;        // natural death rate
+
+  // transitions between classes
+  reulermultinom(2, S, &rate[0], dt, &trans[0]);
+  reulermultinom(3, E, &rate[2], dt, &trans[2]);
+  reulermultinom(2, A, &rate[5], dt, &trans[5]);
+  reulermultinom(3, I, &rate[7], dt, &trans[7]);
+  reulermultinom(2, H, &rate[10], dt, &trans[10]);
+  reulermultinom(2, R, &rate[12], dt, &trans[12]);
+
+  S += births - trans[0] - trans[1] + trans[12];
+  E += trans[0] - trans[2] - trans[3] - trans[4];
+  A += trans[2] - trans[5] - trans[6];
+  I += trans[3] - trans[7] - trans[8] - trans[9];
+  H += trans[7];                          
+  R += trans[5] + trans[8] + trans[10] - trans[12] - trans[13];
+  W += (dw - dt)/sigmaSE;  // standardized i.i.d. white noise;
+  N = S + E + A + I + H + R;
+")
+```
+
+### Observation Function
+
+```{r}
+# seaitr_dmeas <- Csnippet("
+#   lik = dbinom(reports, H, rho, give_log);
+# ")
+
+seaitr_dmeas <- Csnippet("
+  double tol = 1.0e-25;
+  double mean_reports = rho*H;
+  double sd_reports = sqrt(pow(theta*H,2) + mean_reports);
+  if(reports > 0.0){
+    lik = pnorm(reports+0.5,mean_reports,sd_reports,1,0)
+      - pnorm(reports-0.5,mean_reports,sd_reports,1,0) + tol;
+  } else{
+    lik = pnorm(reports+0.5,mean_reports,sd_reports,1,0) + tol;
+  }
+  if (give_log) lik = log(lik);")
+
+# seaitr_rmeas <- Csnippet("
+#   reports = rbinom(H, rho);
+# ")
+
+seaitr_rmeas <- Csnippet("
+  reports = rnorm(rho*H, sqrt( pow(theta*H,2) + rho*H ) );
+  if (reports > 0.0) {
+    reports = nearbyint(reports);
+  } else {
+    reports = 0.0;
+  }")
+
+```
+
+### Single outbreak modeling
+
+#### Initial parameter estimates
+
+```{r}
+N_0_guess <- N_0
+H_0_guess <- df_reports_single_outbreak$reports[1]
+s_0_guess <- 0.22
+# r_0_guess <- 1 - s_0_guess
+mu_b_guess <- BIRTH_RATE
+mu_d_guess <- NATURAL_DEATH_RATE
+sigmaSE_guess <- 0.1
+Beta_guess <- 65
+eps_guess <- 0.05
+alpha_guess <- 1
+f_ai_guess <- 0.9
+# mu_latend_guess <- 7/5
+mu_latend_guess <- 1/5
+mu_ih_guess <- 0.18
+# mu_ar_guess <- 7/10
+mu_ar_guess <- 1/10
+# mu_ir_guess <- 7/10  # inverse of infectious period
+mu_ir_guess <- 1/10  # inverse of infectious period
+# mu_hr_guess <- 7/10
+mu_hr_guess <- 1/10
+# mu_rs_guess <- 7/280
+mu_rs_guess <- 1/700
+rho_guess <- 1
+theta_guess <- 0.002
+param_guesses <- c(
+  N_0 = N_0_guess,
+  H_0 = H_0_guess,
+  s_0 = s_0_guess,
+  # r_0 = r_0_guess,
+  mu_b = mu_b_guess,
+  mu_d = mu_d_guess,
+  sigmaSE = sigmaSE_guess,
+  Beta = Beta_guess,
+  eps = eps_guess,
+  alpha = alpha_guess,
+  f_ai = f_ai_guess,
+  mu_latend = mu_latend_guess,
+  mu_ih = mu_ih_guess,
+  mu_ar = mu_ar_guess,
+  mu_ir = mu_ir_guess,
+  mu_hr = mu_hr_guess,
+  mu_rs = mu_rs_guess,
+  rho = rho_guess,
+  theta = theta_guess
+)
+```
+
+#### pomp object
+
+```{r}
+seaitr_statenames <- c("S", "E", "A", "I", "H", "R", "W", "N")
+seaitr_obsnames <- "reports"
+# seaitr_t0 <- 1
+seaitr_t0 <- df_reports_single_outbreak$date[1]
+# seaitr_covar <- covariate_table(
+#   date=df_reports_single_outbreak$date,
+#   cov_add=df_reports_single_outbreak$cov_add,
+#   times="date"
+# )
+seaitr_rp_names <- c(
+  "sigmaSE",
+  "Beta", 
+  "alpha",
+  "f_ai",
+  "mu_ih",
+  "mu_rs",
+  "rho",
+  "theta"
+)
+seaitr_ivp_names <- c(
+  "s_0"
+  # "r_0"
+)
+seaitr_fixed_params <- c("N_0", "H_0", "eps", "mu_latend", "mu_ar", "mu_ir", "mu_hr", "mu_b", "mu_d")
+seaitr_paramnames <- c(seaitr_rp_names, seaitr_ivp_names, seaitr_fixed_params)
+seaitr_accumvars <- c("W")
+seaitr_partrans <- parameter_trans(
+  log=c(
+    "sigmaSE",
+    "Beta",
+    "alpha",
+    "mu_rs",
+    "theta",
+    "rho"
+  ),
+  logit=c(
+    "f_ai",
+    "mu_ih",
+    "s_0"
+    # "r_0"
+  )
+)
+
+mSEAITR <- (
+  df_reports_single_outbreak
+  %>% select(date, reports)
+  %>% pomp(
+    times = "date",
+    t0 = seaitr_t0,
+    rprocess = euler(
+      step.fun = seaitr_rproc,
+      # delta.t = 1/365.25
+      delta.t = 1/7
+    ),
+    rinit = seaitr_rinit,
+    rmeasure = seaitr_rmeas,
+    dmeasure = seaitr_dmeas,
+    obsnames = seaitr_obsnames,
+    # covarnames = "cov_add",
+    accumvars = seaitr_accumvars,
+    statenames = seaitr_statenames,
+    paramnames = seaitr_paramnames,
+    partrans = seaitr_partrans,
+    params = param_guesses
+  )
+)
+```
+
+#### Simulations
+
+```{r}
+sims_seaitr <- (
+  mSEAITR
+  %>% simulate(
+    nsim = 20,
+    format = "data.frame",
+    include.data = TRUE
+  )
+)
+```
+
+```{r}
+(
+  sims_seaitr
+  %>% filter(.id != "data")
+)
+```
+
+```{r}
+(
+  sims_seaitr
+  %>% filter(.id!="data")
+  %>% ggplot(
+    aes(x = date, y = N, group=.id)
+  )
+  + geom_line()
+  + guides(color = "none")
+)
+```
+
+```{r}
+(
+  sims_seaitr
+  %>% ggplot(
+    aes(x = date, y = reports, group=.id, color=.id=="data")
+  )
+  + geom_line()
+  + guides(color = "none")
+)
+```
+
+#### Local Search
+
+```{r}
+# Parameters 
+chol_rw.sd_rp <- 0.02
+chol_rw.sd_rp_list <- setNames(rep(chol_rw.sd_rp, length(seaitr_rp_names)), seaitr_rp_names)
+chol_rw.sd_ivp <- 0.2
+chol_cooling.fraction.50 <- 0.5 # Level of parameter variance after 50% of iterations
+chol_rw.sd <- rw_sd(
+  sigmaSE = chol_rw.sd_rp,
+  Beta = chol_rw.sd_rp,
+  alpha = chol_rw.sd_rp,
+  f_ai = chol_rw.sd_rp,
+  mu_ih = chol_rw.sd_rp,
+  mu_rs = chol_rw.sd_rp,
+  rho = chol_rw.sd_rp,
+  theta = chol_rw.sd_rp,
+  s_0 = ivp(chol_rw.sd_ivp)
+)
+```
+
+##### Run Iterated Particle Filter
+
+```{r}
+mseaitr_local <- foreach (
+  i=1:chol_Nreps_local, 
+  .combine=c 
+  # .packages=c("dplyr", "pomp")
+) %dopar% {
+  (
+    mif2(
+      mSEAITR,
+      Np=chol_Np,
+      Nmif=chol_Nmif,
+      cooling.fraction.50 = chol_cooling.fraction.50,
+      rw.sd=chol_rw.sd
+    )
+  )
+}
+```
+
+```{r}
+lik_mseaitr_local <- foreach(
+  i=1:chol_Nreps_local,
+  .combine=rbind
+) %dopar% {
+  logmeanexp(
+    replicate(
+      chol_Nreps_eval,
+      logLik(pfilter(mSEAITR, params = coef(mseaitr_local[[i]]), Np = chol_Np))
+    ),
+    se = TRUE
+  )
+}
+```
+
+##### Collect Results
+
+```{r}
+df_seaitr_results_local <- data.frame(
+  t(sapply(mseaitr_local, coef)),
+  log_lik=lik_mseaitr_local[,1],
+  log_lik_se=lik_mseaitr_local[,2]
+)
+```
+
+##### Temp Save
+
+```{r}
+(
+  df_seaitr_results_local 
+  %>% write_csv(
+    file.path(proc_data_dir, sprintf("chol_seaitr_params_%s.csv", Sys.Date())), 
+    # append = TRUE
+  )
+)
+```
+
+##### Diagnostics
+
+```{r}
+summary(df_seaitr_results_local$log_lik, digits = 5)
+```
+
+```{r}
+(
+  mseaitr_local
+  %>% traces()
+  %>% melt()
+  %>% ggplot(
+    aes(
+      x=iteration,
+      y=value,
+      group=.L1,
+      color=factor(.L1)
+    )
+  )
+  + geom_line()
+  + guides(color="none")
+  + facet_wrap(~name, scales="free_y")
+)
+```
+
+```{r}
+#| fig-width: 12
+#| fig-asp: 1
+pairs(
+  ~log_lik+sigmaSE+alpha+Beta+f_ai+mu_ih+mu_rs+theta+s_0,
+  data=subset(df_seaitr_results_local, log_lik > max(log_lik) - 4)
+)
+```
+
+#### Global Search
+
+##### Search box
+
+```{r}
+sigmaSE_guesses <- 10**(runif(chol_Nreps_global, min = -2, max = 0))
+Beta_guesses <- runif(chol_Nreps_global, min = 10, max = 150)
+alpha_guesses <- runif(chol_Nreps_global, min = 0.3, max = 1.2)
+f_ai_guesses <- runif(chol_Nreps_global, min = 0.1, 0.99)
+mu_ih_guesses <- runif(chol_Nreps_global, min = 0.002, max = 1)
+mu_rs_guesses <- 10**(runif(chol_Nreps_global, min = -3, max = 0))
+rho_guesses <- runif(chol_Nreps_global, min=0.01, max=2)
+theta_guesses <- 10**(runif(chol_Nreps_global, min = -5, max = -1))
+s_0_guesses <- runif(chol_Nreps_global, min = 0.05, max = 1)
+
+seaitr_guesses <- as.data.frame(cbind(
+  sigmaSE = sigmaSE_guesses,
+  Beta = Beta_guesses,
+  alpha = alpha_guesses,
+  f_ai = f_ai_guesses,
+  mu_ih = mu_ih_guesses,
+  mu_rs = mu_rs_guesses,
+  rho = rho_guesses,
+  theta = theta_guesses,
+  s_0 = s_0_guesses
+))
+
+# chol_search_box <- rbind(
+#   sigmaSE=c(0.02, 0.2),
+#   Beta=c(1.1, 200),
+#   alpha=c(0.1, 1.2),
+#   f_ai=c(0.1, 0.99),
+#   mu_ih=c(0.001, 0.99),
+#   mu_rs=c(7/3000, 7/20),
+#   rho=c(5e-2, 2),
+#   theta=c(1e-5, 1e-2),
+#   s_0=c(0.05, 0.999)
+# )
+```
+
+```{r}
+chol_search_fixed <- setNames(
+  c(N_0_guess, H_0_guess, eps_guess, mu_latend_guess, mu_ar_guess, mu_ir_guess, mu_hr_guess, mu_b_guess, mu_d_guess),
+  seaitr_fixed_params
+)
+```
+
+##### Run Iterated Particle Filter
+
+```{r}
+mseaitr_global <- foreach (guess=iter(seaitr_guesses, "row"), .combine=c) %dopar% {
+  (
+    mseaitr_local[[1]]
+    %>% mif2(params=c(unlist(guess), chol_search_fixed))
+    # %>% mif2(Nmif=chol_Nmif)
+  )
+}
+
+# mseaitr_global <- (
+#   foreach(
+#     i=1:chol_Nreps_global,
+#     .combine=c
+#   ) %dopar% {
+#     mif2(
+#       mseaitr_local[[1]],
+#       params=c(
+#         apply(chol_search_box, 1, function (x) runif(1, x[1], x[2])),
+#         chol_search_fixed
+#       )
+#     )
+#   }
+# )
+```
+
+```{r}
+lik_mseaitr_global <- (
+  foreach(
+    i=1:chol_Nreps_global,
+    .combine=rbind
+  ) %dopar% {
+    logmeanexp(
+      replicate(
+        chol_Nreps_eval,
+        logLik(pfilter(mSEAITR, params=coef(mseaitr_global[[i]]), Np=chol_Np))
+      ),
+      se=TRUE
+    )
+  }
+)
+```
+
+##### Collect Results
+
+```{r}
+df_seaitr_results_global <- data.frame(
+  t(sapply(mseaitr_global, coef)),
+  log_lik=lik_mseaitr_global[,1],
+  log_lik_se=lik_mseaitr_global[,2]
+)
+```
+
+##### Temp Save
+
+```{r}
+if (run_level > 1) {
+  append <- FALSE
+  col.names <- TRUE
+  row.names <- FALSE
+  if (file.exists(seaitr_filename)) {
+    append <- TRUE
+    col.names <- FALSE
+  }
+  (
+    write.table(
+      df_seaitr_results_global, 
+      file = seaitr_filename, 
+      append = append,
+      col.names = col.names,
+      row.names = row.names
+    )
+  )
+}
+```
+
+##### Diagnostic
+
+```{r}
+chol_seaitr_params <- read.table(
+  seaitr_filename,
+  row.names = NULL,
+  header = TRUE
+)
+```
+
+```{r}
+summary(chol_seaitr_params$log_lik, digits=5)
+```
+
+```{r}
+results_to_plot <- (
+  chol_seaitr_params
+  %>% filter(log_lik>max(log_lik) - 70)
+  %>% bind_rows(seaitr_guesses)
+  %>% mutate(
+    type = if_else(is.na(log_lik), "guess", "result")
+  )
+  %>% arrange(type)
+)
+```
+
+```{r}
+#| fig-width: 12
+#| fig-asp: 1
+pairs(
+  ~log_lik+sigmaSE+alpha+Beta+f_ai+mu_ih+mu_rs+theta+s_0,
+  data=results_to_plot,
+  col=ifelse(results_to_plot$type == "guess", grey(0.5), "red")
+)
+```
+
+### Profile Likelihood
+
+#### Search Parameters
+
+```{r}
+chol_profile_pts <- switch(run_level, 3, 5, 30)
+chol_profile_Nreps <- switch(run_level, 2, 3, 10)
+```
+
+#### Beta Profiles
+
+##### Search Box
+
+```{r}
+chol_prof_lik_params <- (
+  chol_seaitr_params
+  %>% filter(log_lik > max(log_lik) - 20)
+  %>% select(-c(log_lik, log_lik_se, Beta))
+  %>% gather(variable, value)
+  %>% group_by(variable)
+  %>% summarise(
+    min=min(value),
+    max=max(value)
+  )
+  %>% ungroup()
+  %>% column_to_rownames(
+    var="variable"
+  )
+  %>% t()
+)
+  
+```
+
+##### Profile Starts
+
+```{r}
+Beta_profile_starts <- profile_design(
+  Beta = seq(1.5, 300, length=chol_profile_pts),
+  lower = chol_prof_lik_params["min", ],
+  upper = chol_prof_lik_params["max", ],
+  nprof = chol_profile_Nreps
+)
+```
+
+##### Parameters random walk
+
+```{r}
+Beta_profile_rw.sd <- rw_sd(
+  sigmaSE = chol_rw.sd_rp,
+  Beta = 0,
+  alpha = chol_rw.sd_rp,
+  f_ai = chol_rw.sd_rp,
+  mu_ih = chol_rw.sd_rp,
+  mu_rs = chol_rw.sd_rp,
+  rho = chol_rw.sd_rp,
+  theta = chol_rw.sd_rp,
+  s_0 = ivp(chol_rw.sd_ivp)
+)
+```
+
+```{r}
+beta_profile_params <- foreach (start=iter(Beta_profile_starts, "row"), .combine=rbind) %dopar% {
+  mf <- (
+    mSEAITR
+    %>% mif2(
+      params = c(unlist(start)),
+      Np = chol_Np,
+      Nmif = ceiling(chol_Nmif/2),
+      cooling.fraction.50 = 0.5,
+      rw.sd = Beta_profile_rw.sd
+    )
+    %>% mif2(
+      cooling.fraction.50 = 0.1
+    )
+  )
+  ll <- (
+    replicate(
+      chol_Nreps_eval,
+      (
+        mf 
+        %>% pfilter(Np=chol_Np)
+        %>% logLik()
+      )
+    )
+    %>% logmeanexp(se=TRUE)
+  )
+  data.frame(
+    as.list(coef(mf)),
+    log_lik = ll[1],
+    log_lik.se = ll[2]
+  )
+}
+```
+
+##### Temp Save
+
+```{r}
+if (run_level > 1) {
+  append <- FALSE
+  col.names <- TRUE
+  row.names <- FALSE
+  if (file.exists(seaitr_filename)) {
+    append <- TRUE
+    col.names <- FALSE
+  }
+  (
+    write.table(
+      beta_profile_params, 
+      file = seaitr_filename, 
+      append = append,
+      col.names = col.names,
+      row.names = row.names
+    )
+  )
+}
+```
+
+##### Diagnostic
+
+```{r}
+chol_seaitr_params <- read.table(
+  seaitr_filename,
+  row.names = NULL,
+  header = TRUE
+)
+```
+
+```{r}
+summary(chol_seaitr_params$log_lik, digits=5)
+```
+
+```{r}
+results_to_plot <- (
+  chol_seaitr_params
+  %>% filter(log_lik>max(log_lik) - 70)
+  %>% bind_rows(seaitr_guesses)
+  %>% mutate(
+    type = if_else(is.na(log_lik), "guess", "result")
+  )
+  %>% arrange(type)
+)
+```
+
+pairs( \~log_lik+sigmaSE+alpha+Beta+f_ai+mu_ih+mu_rs+theta+s_0, data=subset(df_seaitr_results, log_lik \> max(log_lik) - 4) )
+
+```{r}
+#| fig-width: 12
+#| fig-asp: 1
+pairs(
+  ~log_lik+sigmaSE+alpha+Beta+f_ai+mu_ih+mu_rs+theta+s_0,
+  data=subset(chol_seaitr_params, log_lik > max(log_lik) - 20)
+)
+```
+
+## Benchmarks
+
+### Negative binomial IID Model
+
+```{r}
+nb_lik <- function(theta) {
+  -sum(
+    dnbinom(
+      as.vector(obs(mSEAITR)),
+      size = exp(theta[1]),
+      prob = exp(theta[2]),
+      log = TRUE
+    )
+  )
+}
+```
+
+```{r}
+nb_mle <- optim(c(0, -5), nb_lik)
+```
+
+```{r}
+-nb_mle$value
+```
+
+### ARMA model
+
+```{r}
+log_y <- log(as.vector(obs(mSEAITR)) + 1)
+arma_fit <- arima(
+  log_y,
+  order=c(2, 0, 2),
+  # seasonal=list(
+  #   order=c(1, 0, 1),
+  #   period=52
+  # )
+)
+```
+
+```{r}
+arma_fit$loglik - sum(log_y)
+```

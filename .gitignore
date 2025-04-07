@@ -1,0 +1,19 @@
+# Ignore ref files
+.DS_Store
+.Rproj.user
+.Rhistory
+.Rprofile
+.RData
+.RDataTmp
+.Ruserdata
+
+# Ignore ref folders
+__pycache__/
+cache/
+
+# Ignore data folders
+data/
+
+# Ignore output folders
+images/
+models_output/

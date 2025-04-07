@@ -1,0 +1,4062 @@
+---
+title: "Compartment Model with Vaccinations"
+format: html
+editor: visual
+---
+
+# Environment Setup
+
+```{r setup}
+# Packages
+library(rprojroot)
+library(tidyverse)
+library(pomp)
+library(foreach)
+library(doParallel)
+library(doRNG)
+library(patchwork)
+library(GGally)
+
+# Set Random Seed
+nb_name <-  "Cholera modelling with compartmental models and pomp"
+seed <- sum(sapply(str_split(nb_name, pattern = "", simplify = TRUE), FUN = utf8ToInt))
+
+# Parallel Computing
+n_cores <- parallel::detectCores()
+registerDoParallel(n_cores)
+registerDoRNG(seed)
+
+# Folder Structure
+root <- has_file("Oxford-Cholera.Rproj")$make_fix_file()
+raw_data_dir <- root("data/raw")
+proc_data_dir <- root("data/processed")
+output_dir <- root("models_output/pomp")
+dir.create(output_dir, showWarnings = FALSE)
+img_dir <- root("images")
+```
+
+# Functions
+
+```{r}
+symlog <- function(x) {
+  symlogx <- list()
+  for (i in 1:length(x)) {
+    if (is.na(x[i])) {
+      symlogx[i] <- NA
+    }
+    else if (abs(x[i]) < 1e-5) {
+      symlogx[i] <- x[i]
+    }
+    else if (x[i] > 0) {
+      symlogx[i] <- log(x[i])
+    }
+    else {
+      symlogx[i] <- -log(-x[i])
+    }
+  }
+  return(symlogx)
+}
+```
+
+# Import Data
+
+We are filling in idps but it's more appropriate to focus on time range when we have data. We are also readjusting the number of idps because the figures are too high for the expected population, we need to better estimate the starting population.
+
+```{r}
+# Population
+# uvira_pop <- (
+#   st_read(file.path(proc_data_dir, "uvira_quarters_pop_2016.geojson"))
+#   %>% select(population)
+#   %>% sum()
+# )
+uvira_pop_2016 <- (
+  readxl::read_excel(
+    file.path(raw_data_dir, "annual_population_2016_2022.xlsx"),
+    sheet = "pop_2022"
+  )
+  %>% select("2016")
+  %>% sum()
+)
+
+# df_reports_cov_shap_train
+df_reports <- (
+  read_csv(
+    file.path(proc_data_dir, "uvira_chol_cov_week_20250402.csv", fsep = "/"),
+    show_col_types = FALSE
+  )
+  %>% mutate(
+    date = seq(-1, n()-2, by = 1) / 52,
+    cov = cov - min(cov),
+    idps = replace_na(idps, 0) / 7,  # we need to convert to daily numbers
+    dis = num_disaster_affected / max(num_disaster_affected),
+    vacc_1_prop = 1 - ((1 - vacc_1_prop) ** (1/7)),     # it needs to be the daily rate
+    vacc_2_prop = 1 - ((1 - 2*vacc_2_prop) ** (1/7)), # it needs to be the daily rate
+    vacc_prop = vacc_1_prop + vacc_2_prop
+  )
+  %>% select(
+    date,
+    reports,
+    rdt_confirmed,
+    idps,
+    dis,
+    cov,
+    vacc_1_prop,
+    vacc_2_prop,
+    vacc_prop
+  )
+)
+```
+
+```{r}
+# plot(df_reports$date, exp(df_reports$cov_7), type = "l", col = "black")
+plot(df_reports$date, df_reports$vacc_2_prop, type = "l", col = "black")
+```
+
+```{r}
+plot(df_reports$date, 15 + 250*df_reports$dis, type = "l", col = "black")
+```
+
+```{r}
+# plot(df_reports$date, symlog(df_reports$idps), type = "l", col = "black")
+plot(df_reports$date, df_reports$idps, type = "l", col = "black")
+```
+
+```{r}
+plot(df_reports$date, df_reports$dis, type = "l", col = "black")
+```
+
+```{r}
+p1 <- (
+  ggplot(data = df_reports)
+  + geom_histogram(
+    aes(x = reports), 
+    binwidth = 1,
+    fill = "cornflowerblue"
+  )
+  + labs(
+    x = "Suspected cholera cases",
+    y = "Weekly counts"
+  )
+)
+p2 <- (
+  ggplot(data = df_reports)
+  + geom_histogram(
+    aes(x = rdt_confirmed), 
+    binwidth = 1,
+    fill = "salmon"
+  )
+  + labs(
+    x = "RDT confirmed cases",
+    y = "Weekly counts"
+  )
+)
+p1/p2
+```
+
+Maybe the RDT confirmed are zero inflated?
+
+# Computational Parameters
+
+```{r}
+run_level <- 1
+Np <- switch(run_level, 200, 1e3, 5e3)
+Nmif <- switch(run_level, 50, 200, 400)
+Nreps_eval <- switch(run_level, 4, 10, 20)
+Nreps_local <- switch(run_level, 10, 20, 40)
+Nreps_global <- switch(run_level, 20, 40, 100)
+Nsim <- switch(run_level, 50, 100, 500)
+Napproxbayes_p <- switch(run_level, 10000, 20000, 40000)
+Nbayes_iter <- switch(run_level, 5000, 10000, 40000)
+profile_pts <- switch(run_level, 3, 5, 30)
+profile_Nreps <- switch(run_level, 2, 3, 10)
+```
+
+# Parameters
+
+From: https://databank.worldbank.org/reports.aspx?source=2&series=SP.DYN.CBRT.IN&country= Birth and death rates are per person and per YEAR (all rates in the model are daily rates). Note that one unit of time is one year and each time step is 1/52 so all times and rates need to be scaled to this. For example, an infectious period of 10 days needs to be expressed as the number of units (1/52): (10/7) \* (1/52). For the same reason birth and death rates that are collected as rate per year they only need to be scaled by the number of people but left as year estimates. The time step 1/52 is then applied during the pomp step.
+
+```{r}
+# Birth and death rates
+# From: https://databank.worldbank.org/reports.aspx?source=2&series=SP.DYN.CBRT.IN&country=
+
+# dem_dates <- as.Date(paste0(seq(2016, 2025, by=1), "-06-01")) # We reconstruct a daily history from yearly values
+df_dem <- tibble(
+  date = df_reports$date[seq(1, length(df_reports$date), length.out=10)],
+  deathrate = c(10.1, 9.9, 9.6, 9.4, 9.5, 9.7, 9.4, 9.4, 9.4, 9.4) / (1000),
+  # birthrate = c(44, 43.9, 43.5, 43.2, 42.8, 42.5, 42.2, 41.8, 41.5, 41.2) / (1000)
+  birthrate = c(43.5, 43.4, 43, 42.7, 42.3, 42, 41.7, 41.3, 41, 40.7) * 1.05 / (1000)
+)
+```
+
+# Full model data
+
+```{r}
+df_full <- (
+  df_reports
+  %>% merge(
+    df_dem,
+    by="date",
+    all.x=TRUE
+  )
+  %>% mutate(
+    birthrate = zoo::na.approx(birthrate, na.rm=FALSE),  # We interpolated the rates
+    deathrate = zoo::na.approx(deathrate, na.rm=FALSE)
+  )
+)
+
+df_model <- (
+  df_full
+  %>% select(date, reports)
+  %>% filter(date >= 0)
+)
+
+df_covar <- (
+  df_full
+  %>% select(
+    date, 
+    birthrate, 
+    deathrate, 
+    cov, 
+    idps,
+    dis,
+    vacc_1_prop,
+    vacc_2_prop,
+    vacc_prop
+  )
+)
+```
+
+# With Covariate Modulation + IDPS + Hospitalized + Vaccinations
+
+```{r}
+model_output_filename_1 <- file.path(output_dir, "uvira_multioutbreak_vacc_1.csv")
+```
+
+## Model Definition
+
+### Fixed Parameters
+
+```{r}
+N_0 <- uvira_pop_2016
+mu_latend <- 1 / ((5/7) / 52) # inverse of latent period (5 days transformed in weeks)
+mu_ar <- 1 / ((10/7) / 52) # inverse of asymptomatic period (10 days transformed in weeks)
+mu_ir <- 1 / ((10/7) / 52)  # inverse of infectious period (10 days transformed in weeks)
+mu_hr <- 1 / ((10/7) / 52)  # inverse of infectious period (10 days transformed in weeks)
+
+fixed_params_1 <- c(
+  N_0 = N_0,
+  mu_latend = mu_latend,
+  mu_ar = mu_ar,
+  mu_ir = mu_ir,
+  mu_hr = mu_hr
+)
+```
+
+### Initialization Function
+
+```{r}
+rinit_1 <- Csnippet("
+  double m = N_0/(s_0+e_0+a_0+i_0+h_0+r_0);
+  S = nearbyint(s_0*m);
+  E = nearbyint(e_0*m);
+  A = nearbyint(a_0*m);
+  I = nearbyint(i_0*m);
+  H = nearbyint(h_0*m);
+  R = nearbyint(r_0*m);
+  N = S + E + A + I + H + R;
+  V1 = 0;
+  V2 = 0;
+  C = 0;
+  W = 0;
+")
+```
+
+### Step Function
+
+I'm assuming that getting vaccinated is similar to being infected so if you are already infected adding vaccination would not do much
+
+```{r}
+rproc_1 <- Csnippet("
+  double foi, births, hosp, dw;
+  int idps_scaled;
+  int SV1, RV1, AV1, V1V2;
+  double rate[20];
+  double trans[20];
+  double rate_idps[7];
+  int trans_idps[7];
+  
+  // idps
+  if (idps < 0) {
+    if (N > H) {
+      idps_scaled = floor(fmin((-idps * b_idps), (N-H)/10));
+      double s = (N-H) / (S + V1 + V2 + E + A + I + R);
+      rate_idps[0] = s*S/(N-H);
+      rate_idps[1] = s*V1/(N-H);
+      rate_idps[2] = s*V2/(N-H);
+      rate_idps[3] = s*E/(N-H);
+      rate_idps[4] = s*A/(N-H);
+      rate_idps[5] = s*I/(N-H);
+      rate_idps[6] = s*R/(N-H); 
+      rmultinom(idps_scaled, &rate_idps[0], 7, &trans_idps[0]);
+      S -= fmin(trans_idps[0], S);
+      V1 -= fmin(trans_idps[1], V1);
+      V2 -= fmin(trans_idps[2], V2);
+      E -= fmin(trans_idps[3], E);
+      A -= fmin(trans_idps[4], A);
+      I -= fmin(trans_idps[5], I);
+      R -= fmin(trans_idps[6], R);
+    }
+  }
+  if (idps > 0) {
+    idps_scaled = floor(fmin((idps * b_idps)/5, (N-H)/10));
+    trans_idps[0] = idps_scaled;
+    trans_idps[1] = 0;
+    trans_idps[2] = 0;
+    trans_idps[3] = idps_scaled;
+    trans_idps[4] = idps_scaled;
+    trans_idps[5] = idps_scaled;
+    trans_idps[6] = idps_scaled;
+    S += trans_idps[0];
+    V1 += trans_idps[1];
+    V2 += trans_idps[2];
+    E += trans_idps[3];
+    A += trans_idps[4];
+    I += trans_idps[5];
+    R += trans_idps[6];
+  }
+  
+  N = S + V1 + V2 + E + A + I + H + R;
+  
+  
+  // Vaccination
+  if (vacc_1_prop > 0) {
+    SV1 = rbinom(S, vacc_1_prop);
+    RV1 = rbinom(R, vacc_1_prop);
+    AV1 = rbinom(A, vacc_1_prop);
+    S -= SV1;
+    R -= RV1;
+    A -= AV1;
+    V1 += SV1 + RV1 + AV1;
+  }
+  if (vacc_2_prop > 0) {
+    SV1 = rbinom(S, vacc_2_prop);
+    RV1 = rbinom(R, vacc_2_prop);
+    AV1 = rbinom(A, vacc_2_prop);
+    V1V2 = rbinom(V1, vacc_2_prop);
+    S -= SV1;
+    R -= RV1;
+    A -= AV1;
+    V1 += SV1 + RV1 + AV1 - V1V2;
+    V2 += V1V2;
+  }
+  
+  // Poisson births
+  births = rpois(birthrate * N * dt);
+  
+  // expected force of infection
+  foi = (a_cov + b_cov * cov + b_dis * dis)*(I + eps_A * A)/N;
+  
+  // hospitalization rate
+  hosp = f_h * (1/(1 + H/N));
+
+  // white noise (extrademographic stochasticity)
+  dw = rgammawn(sigmaSE,dt);
+  
+  rate[0] = foi*dw/dt;  // stochastic force of infection
+  //rate[0] = foi;  // stochastic force of infection
+  rate[1] = deathrate;        // natural death rate
+  rate[2] = mu_latend * f_ai;      // transition to asymp
+  rate[3] = mu_latend * (1 - f_ai) * (1 - hosp); // transition to symp
+  rate[4] = mu_latend * (1 - f_ai) * hosp; // transition to hospitalized
+  rate[5] = deathrate;        // natural death rate
+  rate[6] = mu_ar;       // asymp -> recovery
+  rate[7] = deathrate;        // natural death rate
+  rate[8] = mu_ir;       // symp -> recovered
+  rate[9] = deathrate;        // natural death rate
+  rate[10] = mu_hr;       // hospitalized -> recovered
+  rate[11] = deathrate;        // natural death rate
+  rate[12] = mu_rs;       // recovered -> susceptible
+  rate[13] = deathrate;        // natural death rate
+  rate[14] = f_vacc_1 * foi;
+  rate[15] = mu_vacc_1;
+  rate[16] = deathrate;
+  rate[17] = f_vacc_2 * foi;
+  rate[18] = mu_vacc_2;
+  rate[19] = deathrate;
+  
+  // transitions between compartments
+  reulermultinom(2, S, &rate[0], dt, &trans[0]);
+  reulermultinom(4, E, &rate[2], dt, &trans[2]);
+  reulermultinom(2, A, &rate[6], dt, &trans[6]);
+  reulermultinom(2, I, &rate[8], dt, &trans[8]);
+  reulermultinom(2, H, &rate[10], dt, &trans[10]);
+  reulermultinom(2, R, &rate[12], dt, &trans[12]);
+  reulermultinom(3, V1, &rate[14], dt, &trans[14]);
+  reulermultinom(3, V2, &rate[17], dt, &trans[17]);
+  
+  S += births - trans[0] - trans[1] + trans[12] + trans[15];
+  E += trans[0] - trans[2] - trans[3] - trans[4] - trans[5];
+  A += trans[2] - trans[6] - trans[7] + trans[14] + trans[17];
+  I += trans[3] - trans[8] - trans[9];
+  H += trans[4] - trans[10] - trans[11];
+  R += trans[6] + trans[8] + trans[10] - trans[12] - trans[13];
+  V1 += trans[18] - trans[14] - trans[15] - trans[16];
+  V2 += -trans[17] - trans[18] - trans[19];
+  
+    // Measured
+  C += trans[4];
+  
+  // Noise
+  W += (dw - dt)/sigmaSE;  
+  
+  N = S + V1 + V2 + E + A + I + H + R;
+")
+```
+
+
+
+  
+
+```{r}
+rproc_1 <- Csnippet("
+  double foi, births, hosp, dw;
+  double idps_scaled;
+  double rate[23];
+  double trans[23];
+  double rate_idps[7];
+  int trans_idps[7];
+  
+  // idps
+  if (idps < 0) {
+    if (N > H) {
+      idps_scaled = floor(fmin((-idps * b_idps), (N-H)/10));
+      double s = (N-H) / (S + V1 + V2 + E + A + I + R);
+      rate_idps[0] = s*S/(N-H);
+      rate_idps[1] = s*V1/(N-H);
+      rate_idps[2] = s*V2/(N-H);
+      rate_idps[3] = s*E/(N-H);
+      rate_idps[4] = s*A/(N-H);
+      rate_idps[5] = s*I/(N-H);
+      rate_idps[6] = s*R/(N-H);
+      rmultinom(idps_scaled, &rate_idps[0], 7, &trans_idps[0]);
+      S -= fmin(trans_idps[0], S);
+      V1 -= fmin(trans_idps[1], V1);
+      V2 -= fmin(trans_idps[2], V2);
+      E -= fmin(trans_idps[3], E);
+      A -= fmin(trans_idps[4], A);
+      I -= fmin(trans_idps[5], I);
+      R -= fmin(trans_idps[6], R);
+    }
+  }
+  if (idps > 0) {
+    idps_scaled = floor(fmin((idps * b_idps)/5, (N-H)/10));
+    trans_idps[0] = idps_scaled;
+    trans_idps[1] = 0;
+    trans_idps[2] = 0;
+    trans_idps[3] = idps_scaled;
+    trans_idps[4] = idps_scaled;
+    trans_idps[5] = idps_scaled;
+    trans_idps[6] = idps_scaled;
+    S += trans_idps[0];
+    V1 += trans_idps[1];
+    V2 += trans_idps[2];
+    E += trans_idps[3];
+    A += trans_idps[4];
+    I += trans_idps[5];
+    R += trans_idps[6];
+  }
+  
+  N = S + V1 + V2 + E + A + I + H + R;
+  
+  // Poisson births
+  births = rpois(birthrate * N * dt);
+  
+  // expected force of infection
+  foi = (a_cov + b_cov * cov + b_dis * dis)*(I + eps_A * A)/N;
+
+  // white noise (extrademographic stochasticity)
+  dw = rgammawn(sigmaSE,dt);
+  
+  // hospitalization rate
+  hosp = f_h * (1/(1 + H/N));
+  
+  rate[0] = foi*dw/dt;  // stochastic force of infection
+  //rate[0] = foi;  // stochastic force of infection
+  rate[1] = vacc_1_prop * 365; // vaccination
+  rate[2] = deathrate;        // natural death rate
+  rate[3] = mu_latend * f_ai;      // transition to asymp
+  rate[4] = mu_latend * (1 - f_ai) * (1 - hosp); // transition to symp
+  rate[5] = mu_latend * (1 - f_ai) * hosp; // transition to hospitalized
+  rate[6] = deathrate;        // natural death rate
+  rate[7] = mu_ar;       // asymp -> recovery
+  rate[8] = deathrate;        // natural death rate
+  rate[9] = mu_ir;       // symp -> recovered
+  rate[10] = deathrate;        // natural death rate
+  rate[11] = mu_hr;       // hospitalized -> recovered
+  rate[12] = deathrate;        // natural death rate
+  rate[13] = mu_rs;       // recovered -> susceptible
+  rate[14] = vacc_1_prop * 365; //vaccination
+  rate[15] = deathrate;        // natural death rate
+  rate[16] = vacc_2_prop * 365;
+  rate[17] = f_vacc_1 * foi;
+  rate[18] = mu_vacc_1;
+  rate[19] = deathrate;
+  rate[20] = f_vacc_2 * foi;
+  rate[21] = mu_vacc_2;
+  rate[22] = deathrate;
+  
+  // transitions between classes
+  reulermultinom(3, S, &rate[0], dt, &trans[0]);
+  reulermultinom(4, E, &rate[3], dt, &trans[3]);
+  reulermultinom(2, A, &rate[7], dt, &trans[7]);
+  reulermultinom(2, I, &rate[9], dt, &trans[9]);
+  reulermultinom(2, H, &rate[11], dt, &trans[11]);
+  reulermultinom(3, R, &rate[13], dt, &trans[13]);
+  reulermultinom(4, V1, &rate[16], dt, &trans[16]);
+  reulermultinom(3, V2, &rate[20], dt, &trans[20]);
+  
+  S += births - trans[0] - trans[1] - trans[2] + trans[13] + trans[18];
+  E += trans[0] - trans[3] - trans[4] - trans[5] - trans[6];
+  A += trans[3] - trans[7] - trans[8] + trans[17] + trans[20];
+  I += trans[4] - trans[9] - trans[10];
+  H += trans[5] - trans[11] - trans[12];
+  R += trans[7] + trans[9] + trans[11] - trans[13] - trans[14] - trans[15];
+  V1 += trans[1] + trans[14] + trans[21] - trans[16] - trans[17] - trans[18] - trans[19];
+  V2 += trans[16] - trans[20] - trans[21] - trans[22];
+
+  // Measured
+  C += trans[5];
+  
+  // Noise
+  W += (dw - dt)/sigmaSE;  
+  
+  N = S + V1 + V2 + E + A + I + H + R;
+")
+```
+
+### Observation Function
+
+```{r}
+dmeas_1 <- Csnippet("
+  double f;
+  double tol = 1.0e-25;
+  if (tau > 0.0) {
+    f = dnbinom_mu(nearbyint(reports), 1.0/tau, rho*C, give_log) + tol;
+  }
+  else {
+    f = dpois(nearbyint(reports), rho*C, give_log) + tol;
+  }
+  lik = (give_log) ? f : exp(f);
+")
+
+
+# dmeas_6 <- Csnippet("
+#   double tol = 1.0e-25;
+#   double mean_reports = rho*C;
+#   double sd_reports = sqrt(pow(tau*C,2) + mean_reports);
+#   if(reports > 0.0){
+#     lik = pnorm(reports+0.5,mean_reports,sd_reports,1,0)
+#       - pnorm(reports-0.5,mean_reports,sd_reports,1,0) + tol;
+#   } else{
+#     lik = pnorm(reports+0.5,mean_reports,sd_reports,1,0) + tol;
+#   }
+#   if (give_log) lik = log(lik);
+# ")
+
+rmeas_1 <- Csnippet("
+  if (tau > 0.0) {
+    reports = rnbinom_mu(1.0/tau, rho*C);
+  }
+  else {
+    reports = rpois(rho*C);
+  }
+")
+
+# rmeas_6 <- Csnippet("
+#   reports = rnorm(rho*C, sqrt( pow(tau*C,2) + rho*C ) );
+#   if (reports > 0.0) {
+#     reports = nearbyint(reports);
+#   } else {
+#     reports = 0.0;
+#  }")
+
+```
+
+## Initial parameter estimates
+
+```{r}
+
+# a_cov_guess <- 17.0393
+# b_cov_guess <- 69.6589
+# eps_A_guess <- 0.731113
+# f_ai_guess <- 0.926581
+# f_h_guess <- 0.828567
+# mu_rs_guess <- 1 / ((150/7) / 52) # inverse of immunity period (50 days transformed in weeks)
+# rho_guess <- 0.9
+# s_0_guess <- 0.245589
+# h_0_guess <- 0.119584
+# i_0_guess <- 0.285245 #min(floor(H_0_guess / (1 - exp(-mu_ih_guess))), N_0)
+# a_0_guess <- 0.19815 #min(floor(f_ai_guess/(1 - f_ai_guess) * I_0_guess), N_0)
+# e_0_guess <- 0.0463198 #min(floor((A_0_guess + I_0_guess) / (1 - exp(-mu_latend_guess))), N_0)
+# r_0_guess <- 0.105113
+# tau_guess <- 0.002
+# b_idps_guess <- 0.99
+# b_dis_guess <- 10
+# sigmaSE_guess <- 0.05
+# f_vacc_1_guess <- 0.838041
+# f_vacc_2_guess <- 0.170122
+# mu_vacc_1_guess <- 0.630433
+# mu_vacc_2_guess <- 11.4946
+      
+a_cov_guess <- 40
+b_cov_guess <- 120
+eps_A_guess <- 0.08
+f_ai_guess <- 0.55
+f_h_guess <- 0.03
+mu_rs_guess <- 1 / ((150/7) / 52) # inverse of immunity period (50 days transformed in weeks)
+rho_guess <- 0.9
+s_0_guess <- 0.55
+h_0_guess <- df_reports$reports[1] / N_0
+i_0_guess <- 0.005 #min(floor(H_0_guess / (1 - exp(-mu_ih_guess))), N_0)
+a_0_guess <- 0.01 #min(floor(f_ai_guess/(1 - f_ai_guess) * I_0_guess), N_0)
+e_0_guess <- 0.02 #min(floor((A_0_guess + I_0_guess) / (1 - exp(-mu_latend_guess))), N_0)
+r_0_guess <- max(1 - s_0_guess - e_0_guess - a_0_guess - i_0_guess - h_0_guess, 0)
+tau_guess <- 0.002
+b_idps_guess <- 0.05
+b_dis_guess <- 1
+sigmaSE_guess <- 0.05
+f_vacc_1_guess <- 0.1
+f_vacc_2_guess <- 0.1
+mu_vacc_1_guess <- 1 / ((365/7) / 52) # inverse of immunity period
+mu_vacc_2_guess <- 1 / ((365/7) / 52) # inverse of immunity period
+
+init_params_1 <- c(
+  fixed_params_1,
+  sigmaSE = sigmaSE_guess,
+  f_vacc_1 = f_vacc_1_guess,
+  f_vacc_2 = f_vacc_2_guess,
+  mu_vacc_1 = mu_vacc_1_guess,
+  mu_vacc_2 = mu_vacc_2_guess,
+  s_0 = s_0_guess,
+  e_0 = e_0_guess,
+  a_0 = a_0_guess,
+  i_0 = i_0_guess,
+  h_0 = h_0_guess,
+  r_0 = r_0_guess,
+  a_cov = a_cov_guess,
+  b_cov = b_cov_guess,
+  eps_A = eps_A_guess,
+  f_ai = f_ai_guess,
+  f_h = f_h_guess,
+  mu_rs = mu_rs_guess,
+  rho = rho_guess,
+  tau = tau_guess,
+  b_dis = b_dis_guess,
+  b_idps = b_idps_guess
+)
+```
+
+## POMP object
+
+```{r}
+statenames_1 <- c(
+  "S", 
+  "V1",
+  "V2",
+  "E", 
+  "A", 
+  "I", 
+  "H",
+  "R", 
+  "C",
+  "W",
+  "N"
+)
+obsnames_1 <- "reports"
+covar_1 <- covariate_table(
+  df_covar %>% select(c(date, cov, dis, idps, birthrate, deathrate, vacc_1_prop, vacc_2_prop)),
+  times="date"
+)
+covarnames_1 <- c(
+  "cov", 
+  "dis",
+  "idps",
+  "birthrate", 
+  "deathrate",
+  "vacc_1_prop",
+  "vacc_2_prop"
+)
+rp_names_log_1 <- c(
+  "sigmaSE",
+  "a_cov",
+  "b_cov",
+  "b_dis",
+  "mu_rs",
+  "mu_vacc_1",
+  "mu_vacc_2",
+  "tau"
+)
+rp_names_logit_1 <- c(
+  "f_ai",
+  "eps_A",
+  "f_h",
+  "b_idps",
+  "f_vacc_1",
+  "f_vacc_2",
+  "rho"
+)
+ivp_names_1 <- c(
+  "s_0",
+  "e_0",
+  "a_0",
+  "i_0",
+  "h_0",
+  "r_0"
+)
+
+paramnames_1 <- c(rp_names_log_1, rp_names_logit_1, ivp_names_1, names(fixed_params_1))
+accumvars_1 <- c(
+  "C",
+  "W"
+)
+partrans_1 <- parameter_trans(
+  log=rp_names_log_1,
+  logit=rp_names_logit_1,
+  barycentric=ivp_names_1
+)
+
+m_1 <- (
+  df_model
+  %>% select(date, reports)
+  %>% pomp(
+    times = "date",
+    t0 = df_covar$date[1],
+    rprocess = euler(
+      step.fun = rproc_1,
+      delta.t = 1/52/7
+    ),
+    rinit = rinit_1,
+    rmeasure = rmeas_1,
+    dmeasure = dmeas_1,
+    obsnames = obsnames_1,
+    covar = covar_1,
+    covarnames = covarnames_1,
+    accumvars = accumvars_1,
+    statenames = statenames_1,
+    paramnames = paramnames_1,
+    partrans = partrans_1,
+    params = init_params_1
+  )
+)
+```
+
+## Simulations
+
+```{r}
+sims_1 <- (
+  m_1
+  %>% simulate(
+    nsim = 20,
+    format = "data.frame",
+    include.data = TRUE
+  )
+)
+```
+
+```{r}
+pf_sim_1 <- pfilter(m_1, Np = 1000)
+lk_sim_1 <- logLik(pf_sim_1)
+lk_sim_1
+```
+
+```{r}
+#| fig-height: 10
+(
+  sims_1
+  %>% filter(.id == 1)
+  %>% select(
+    date, 
+    S,
+    V1,
+    V2,
+    E,
+    A,
+    I,
+    H,
+    C,
+    R,
+    W,
+    N
+  )
+  %>% pivot_longer(
+    cols = -date,
+    names_to = "compartment",
+    values_to = "counts"
+  )
+  %>% ggplot(
+    aes(x = date, y = counts, color = compartment)
+  )
+  + facet_wrap(~compartment, scales = "free_y", ncol = 3)
+  + theme(
+    panel.background = element_blank(),
+    panel.border = element_rect(fill = NA, color = "black", linewidth = 1),
+    panel.grid = element_blank(),
+    strip.text = element_text(size = 20),
+    plot.background = element_blank(),
+    plot.title = element_text(size = 16, hjust = 0.5),
+    axis.title = element_text(size = 20),
+    axis.text = element_text(size = 18),
+  )
+  + geom_line()
+  + guides(color = "none")
+)
+```
+
+```{r}
+(sims_1 %>% filter(.id == 7))$R
+```
+
+```{r}
+(
+  sims_1 
+  %>% filter(.id == 1) 
+  %>% slice(seq(195, 210, 1))
+  %>% select(
+    date,
+    idps,
+    S,
+    S_1,
+    S_2,
+    E,
+    A,
+    I,
+    H,
+    R,
+    N
+  )
+)
+```
+
+```{r}
+#| fig-width: 4.5
+#| fig-height: 3
+(
+  sims_1
+  %>% mutate(
+    date = as.Date("2016-01-01") + 52 * date
+  )
+  %>% ggplot(
+    aes(x = date, y = reports, group=.id, color=.id=="data")
+  )
+  + theme(
+    panel.background = element_blank(),
+    panel.border = element_rect(fill = NA, color = "black", linewidth = 1),
+    panel.grid = element_blank(),
+    plot.background = element_blank(),
+    plot.title = element_text(size = 16, hjust = 0.5),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12),
+  )
+  + geom_line()
+  + guides(color = "none")
+  + labs(
+    title = "Simulated and true reported cases",
+    x = "Date",
+    y = "Counts"
+  )
+)
+ggsave(filename = "test_pomp_simulation.png", path = img_dir)
+```
+
+## Local Search
+
+```{r}
+# Parameters 
+rw.sd_rp <- 0.02
+rw.sd_ivp <- 0.2
+cooling.fraction.50 <- 0.5 # Level of parameter variance after 50% of iterations
+rw.sd_1 <- rw_sd(
+  s_0 = ivp(rw.sd_ivp),
+  e_0 = ivp(rw.sd_ivp),
+  a_0 = ivp(rw.sd_ivp),
+  i_0 = ivp(rw.sd_ivp),
+  h_0 = ivp(rw.sd_ivp),
+  r_0 = ivp(rw.sd_ivp),
+  sigmaSE = rw.sd_rp,
+  f_vacc_1 = rw.sd_rp,
+  f_vacc_2 = rw.sd_rp,
+  mu_vacc_1 = rw.sd_rp,
+  mu_vacc_2 = rw.sd_rp,
+  a_cov = rw.sd_rp,
+  b_cov = rw.sd_rp,
+  b_dis = rw.sd_rp,
+  b_idps = rw.sd_rp,
+  f_ai = rw.sd_rp,
+  eps_A = rw.sd_rp,
+  f_h = rw.sd_rp,
+  mu_rs = rw.sd_rp,
+  rho = rw.sd_rp,
+  tau = rw.sd_rp
+)
+```
+
+### Run Iterated Particle Filter
+
+```{r}
+start <- Sys.time()
+m_local_1 <- foreach (
+  i=1:Nreps_local, 
+  .combine=c 
+) %dopar% {
+  init_params_1[rp_names_log_1] <- rlnorm(
+    n=length(rp_names_log_1), 
+    meanlog=log(init_params_1[rp_names_log_1]),
+    sdlog=1
+  )
+  init_params_1[c(rp_names_logit_1, ivp_names_1)] <- runif(
+    n=length(c(rp_names_logit_1, ivp_names_1)),
+    min=0.01,
+    max=0.99
+  )
+  (
+    mif2(
+      m_1,
+      Np=Np,
+      Nmif=Nmif,
+      params=init_params_1,
+      cooling.fraction.50 = cooling.fraction.50,
+      rw.sd=rw.sd_1
+    )
+  )
+}
+end <- Sys.time()
+sprintf("Run time of local iterated particle filter: %d minutes", as.integer(round(difftime(end, start, units='mins'))))
+```
+
+```{r}
+loglik_local_all_1 <- foreach(
+  mf = m_local_1,
+  .combine=rbind
+) %dopar% {
+  pf <- replicate(
+    n = Nreps_eval,
+    logLik(pfilter(mf, Np = Np))
+  )
+  logmeanexp(pf, se = TRUE)
+}
+```
+
+Focus on the highest estimated likelihood to get MLE
+
+```{r}
+m_local_mle_1 <- m_local_1[[which.max(loglik_local_all_1[,1])]]
+params_local_1 <- coef(m_local_mle_1)
+loglik_local_best_1 <- logmeanexp(
+  replicate(
+    n = Nreps_eval,
+    logLik(pfilter(m_local_mle_1, Np = 1000))
+  ),
+  se = TRUE
+)
+```
+
+```{r}
+loglik_local_best_1
+```
+
+### Collect Results
+
+```{r}
+df_results_local_1 <- data.frame(
+  t(sapply(m_local_1, coef)),
+  log_lik=loglik_local_all_1[,1],
+  log_lik_se=loglik_local_all_1[,2]
+)
+```
+
+### Temp Save
+
+```{r}
+if (run_level > 0) {
+  append <- FALSE
+  col.names <- TRUE
+  row.names <- FALSE
+  if (file.exists(model_output_filename_1)) {
+    append <- TRUE
+    col.names <- FALSE
+  }
+  (
+    write.table(
+      df_results_local_1, 
+      file = model_output_filename_1, 
+      append = append,
+      col.names = col.names,
+      row.names = row.names
+    )
+  )
+}
+```
+
+### Diagnostics
+
+```{r}
+model_params_1 <- read.table(
+  model_output_filename_1,
+  row.names = NULL,
+  header = TRUE
+)
+```
+
+#### Summary
+
+```{r}
+summary(model_params_1$log_lik, digits = 5)
+```
+
+#### Pair plot
+
+```{r}
+(
+  m_local_1
+  %>% traces()
+  %>% melt()
+  %>% filter(!name %in% c(names(fixed_params_1), ivp_names_1))
+  %>% ggplot(
+    aes(
+      x=iteration,
+      y=value,
+      group=.L1,
+      color=factor(.L1)
+    )
+  )
+  + geom_line()
+  + guides(color="none")
+  + facet_wrap(~name, scales="free_y")
+)
+```
+
+```{r}
+#| fig-width: 12
+#| fig-asp: 1
+data_to_plot <- (
+  model_params_1
+  %>% filter(!is.na(log_lik))
+  %>% filter(log_lik > max(log_lik) - 100)
+)
+
+pairs(
+  ~(
+    log_lik
+    +a_cov
+    +b_cov
+    +b_dis
+    +f_ai
+    +eps_A
+    +mu_rs
+    +tau
+    +rho
+    +f_vacc_1
+    +f_vacc_2
+    +mu_vacc_1
+    +mu_vacc_2
+    +sigmaSE
+  ),
+  data=data_to_plot
+)
+```
+
+## Global Search
+
+### Search box
+
+```{r}
+s_0_guesses <- runif(Nreps_global, min = 0.01, max = 0.99)
+e_0_guesses <- runif(Nreps_global, min = 0.01, max = 0.99)
+a_0_guesses <- runif(Nreps_global, min = 0.01, max = 0.99)
+i_0_guesses <- runif(Nreps_global, min = 0.01, max = 0.99)
+h_0_guesses <- runif(Nreps_global, min = 0.01, max = 0.99)
+r_0_guesses <- runif(Nreps_global, min = 0.01, max = 0.99)
+a_cov_guesses <- runif(Nreps_global, min = 0, max = 100)
+b_cov_guesses <- runif(Nreps_global, min = 2, max = 200)
+b_dis_guesses <- runif(Nreps_global, min = 0, max = 50)
+b_idps_guesses <- runif(Nreps_global, min = 0, max = 1)
+eps_A_guesses <- runif(Nreps_global, min = 0.01, max = 0.5)
+f_ai_guesses <- runif(Nreps_global, min = 0.1, max = 0.99)
+f_h_guesses <- runif(Nreps_global, min = 0.01, max = 0.99)
+mu_rs_guesses <- runif(Nreps_global, min = 1e-3, max = 50)
+f_vacc_1_guesses <- runif(Nreps_global, min = 0.01, max = 0.99)
+f_vacc_2_guesses <- runif(Nreps_global, min = 0.01, max = 0.99)
+mu_vacc_1_guesses <- runif(Nreps_global, min = 1e-3, max = 100)
+mu_vacc_2_guesses <- runif(Nreps_global, min = 1e-3, max = 100)
+rho_guesses <- runif(Nreps_global, min = 0.01, max = 1)
+tau_guesses <- runif(Nreps_global, min = 1e-4, max = 5)
+sigmaSE_guesses <- runif(Nreps_global, min = 0.01, max = 0.2)
+
+
+global_guesses_1 <- as.data.frame(cbind(
+  s_0 = s_0_guesses,
+  e_0 = e_0_guesses,
+  a_0 = a_0_guesses,
+  i_0 = i_0_guesses,
+  h_0 = h_0_guesses,
+  r_0 = r_0_guesses,
+  sigmaSE = sigmaSE_guesses,
+  a_cov = a_cov_guesses,
+  b_cov = b_cov_guesses,
+  b_dis = b_dis_guesses,
+  b_idps = b_idps_guesses,
+  eps_A = eps_A_guesses,
+  f_ai = f_ai_guesses,
+  f_h = f_h_guesses,
+  mu_rs = mu_rs_guesses,
+  f_vacc_1 = f_vacc_1_guesses,
+  f_vacc_2 = f_vacc_2_guesses,
+  mu_vacc_1 = mu_vacc_1_guesses,
+  mu_vacc_2 = mu_vacc_2_guesses,
+  tau = tau_guesses,
+  rho = rho_guesses
+))
+```
+
+### Run Iterated Particle Filter
+
+```{r}
+start <- Sys.time()
+m_global_1 <- foreach (guess=iter(global_guesses_1, "row"), .combine=c) %dopar% {
+  (
+    m_local_mle_1
+    %>% mif2(Nmif=Nmif, params=c(fixed_params_1, unlist(guess)))
+    %>% mif2(Nmif=Nmif, cooling.fraction.50 = 0.1)
+  )
+}
+end <- Sys.time()
+sprintf("Run time of global iterated particle filter: %d minutes", as.integer(round(difftime(end, start, units='mins'))))
+```
+
+```{r}
+loglik_global_all_1 <- (
+  foreach(
+    i=1:Nreps_global,
+    .combine=rbind
+  ) %dopar% {
+    logmeanexp(
+      replicate(
+        Nreps_eval,
+        logLik(pfilter(m_1, params=coef(m_global_1[[i]]), Np=1000))
+      ),
+      se=TRUE
+    )
+  }
+)
+```
+
+### Collect Results
+
+```{r}
+df_results_global_1 <- (
+  data.frame(
+    t(sapply(m_global_1, coef)),
+    log_lik=loglik_global_all_1[,1],
+    log_lik_se=loglik_global_all_1[,2]
+  )
+  %>% select(
+    names(df_results_local_1)
+  )
+)
+```
+
+### Temp Save
+
+```{r}
+if (run_level > 0) {
+  append <- FALSE
+  col.names <- TRUE
+  row.names <- FALSE
+  if (file.exists(model_output_filename_1)) {
+    append <- TRUE
+    col.names <- FALSE
+  }
+  (
+    write.table(
+      df_results_global_1, 
+      file = model_output_filename_1, 
+      append = append,
+      col.names = col.names,
+      row.names = row.names
+    )
+  )
+}
+```
+
+### Diagnostic
+
+```{r}
+model_params_1 <- read.table(
+  model_output_filename_1,
+  row.names = NULL,
+  header = TRUE
+)
+```
+
+#### Summary
+
+```{r}
+summary(model_params_1$log_lik, digits=5)
+```
+
+#### Pair plot
+
+```{r}
+#| fig-width: 12
+#| fig-asp: 1
+res_to_plot <- (
+  model_params_1
+  %>% filter(!is.na(log_lik))
+  %>% filter((log_lik>max(log_lik) - 100))
+  %>% bind_rows(global_guesses_1)
+  %>% mutate(
+    type = if_else(is.na(log_lik), "guess", "result")
+  )
+  %>% arrange(type)
+)
+pairs(
+  ~(
+    log_lik
+    +a_cov
+    +b_cov
+    +b_dis
+    +f_ai
+    +eps_A
+    +mu_rs
+    +tau
+    +rho
+    +f_vacc_1
+    +f_vacc_2
+    +mu_vacc_1
+    +mu_vacc_2
+    +sigmaSE
+  ),
+  data=res_to_plot,
+  col=ifelse(res_to_plot$type == "guess", grey(0.5), "red")
+)
+```
+
+#### Simulations from best model
+
+```{r}
+sort(loglik_global_all_1[,1], decreasing = TRUE)
+```
+
+```{r}
+sims_global_best_ll_1 <- (
+  m_global_1[[which(rank(-loglik_global_all_1[,1]) == 3)]]
+  %>% simulate(
+    nsim = 100,
+    format = "data.frame",
+    include.data = TRUE
+  )
+)
+sims_global_best_ll_agg_1 <- (
+  sims_global_best_ll_1
+  %>% filter(.id != "data")
+  %>% select(.id, date, reports)
+  %>% group_by(date)
+  %>% summarise(
+    reports_mean = mean(reports),
+    reports_median = median(reports),
+    reports_10q = quantile(reports, 0.1),
+    reports_90q = quantile(reports, 0.9)
+  )
+)
+
+sims_global_best_sd_1 <- (
+  m_global_1[[which.min(loglik_global_all_1[,2])]]
+  %>% simulate(
+    nsim = 100,
+    format = "data.frame",
+    include.data = TRUE
+  )
+)
+sims_global_best_sd_agg_1 <- (
+  sims_global_best_sd_1
+  %>% filter(.id != "data")
+  %>% select(.id, date, reports)
+  %>% group_by(date)
+  %>% summarise(
+    reports_mean = mean(reports),
+    reports_median = median(reports),
+    reports_10q = quantile(reports, 0.1),
+    reports_90q = quantile(reports, 0.9)
+  )
+)
+```
+
+```{r}
+#| fig-width: 10
+#| fig-height: 6
+p1 <- (
+  ggplot()
+  + theme(
+    panel.background = element_blank(),
+    panel.border = element_rect(fill = NA, color = "black", linewidth = 1),
+    panel.grid = element_blank(),
+    plot.background = element_blank(),
+    plot.title = element_text(size = 16, hjust = 0.5),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12),
+  )
+  + geom_line(
+    data = df_model,
+    mapping = aes(x = date, y = reports), 
+    color = "black", 
+    linetype = "dashed"
+  )
+  + geom_line(
+      data = sims_global_best_ll_agg_1,
+      mapping = aes(x = date, y = reports_mean), 
+      color = "firebrick", 
+      linetype = "solid",
+      linewidth = 1
+  )
+  + geom_line(
+      data = sims_global_best_ll_agg_1,
+      mapping = aes(x = date, y = reports_median), 
+      color = "cornflowerblue", 
+      linetype = "solid",
+      linewidth = 1
+  )
+  + geom_ribbon(
+    data = sims_global_best_ll_agg_1,
+    aes(x = date, ymin = reports_10q, ymax = reports_90q),
+    alpha=0.3,
+    fill = "cornflowerblue"
+  )
+  + guides(color = "none")
+  + labs(
+    title = "Simulated and true reported cases - best Log Likelihood",
+    x = "Date",
+    y = "Counts"
+  )
+)
+p2 <- (
+  ggplot()
+  + theme(
+    panel.background = element_blank(),
+    panel.border = element_rect(fill = NA, color = "black", linewidth = 1),
+    panel.grid = element_blank(),
+    plot.background = element_blank(),
+    plot.title = element_text(size = 16, hjust = 0.5),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12),
+  )
+  + geom_line(
+    data = df_model,
+    mapping = aes(x = date, y = reports), 
+    color = "black", 
+    linetype = "dashed"
+  )
+  + geom_line(
+      data = sims_global_best_sd_agg_1,
+      mapping = aes(x = date, y = reports_mean), 
+      color = "firebrick", 
+      linetype = "solid",
+      linewidth = 1
+  )
+  + geom_line(
+      data = sims_global_best_sd_agg_1,
+      mapping = aes(x = date, y = reports_median), 
+      color = "cornflowerblue", 
+      linetype = "solid",
+      linewidth = 1
+  )
+  + geom_ribbon(
+    data = sims_global_best_sd_agg_1,
+    aes(x = date, ymin = reports_10q, ymax = reports_90q),
+    alpha=0.3,
+    fill = "cornflowerblue"
+  )
+  + guides(color = "none")
+  + labs(
+    title = "Simulated and true reported cases - best SD",
+    x = "Date",
+    y = "Counts"
+  )
+)
+p1/p2
+```
+
+```{r}
+coef(m_global_1[[which(rank(-loglik_global_all_1[,1]) == 3)]])
+```
+
+```{r}
+#| fig-width: 10
+#| fig-height: 10
+(
+  sims_global_best_ll_1
+  %>% filter(.id == 2)
+  %>% select(
+    date, 
+    S, 
+    V1,
+    V2,
+    E, 
+    A, 
+    I, 
+    H, 
+    C,
+    R, 
+    W,
+    N
+  )
+  %>% pivot_longer(
+    cols = -date,
+    names_to = "compartment",
+    values_to = "counts"
+  )
+  %>% ggplot(
+    aes(x = date, y = counts, color = compartment)
+  )
+  + facet_wrap(~compartment, scales = "free_y")
+  + geom_line()
+  + guides(color = "none")
+  + theme(
+    panel.background = element_blank(),
+    panel.border = element_rect(fill = NA, color = "black", linewidth = 1),
+    panel.grid = element_blank(),
+    plot.background = element_blank(),
+    plot.title = element_text(size = 16, hjust = 0.5),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12),
+  )
+  + labs(
+    x = "Date",
+    y = "Counts"
+  )
+)
+```
+
+## Profile Likelihood
+
+### b_cov Profiles
+
+#### Search Box
+
+```{r}
+bcov_prof_lik_params_6 <- (
+  model_params_6
+  %>% filter(log_lik > max(log_lik) - 100)
+  %>% select(-c(log_lik, log_lik_se, b_cov))
+  %>% gather(variable, value)
+  %>% group_by(variable)
+  %>% summarise(
+    min=min(value),
+    max=max(value)
+  )
+  %>% ungroup()
+  %>% column_to_rownames(
+    var="variable"
+  )
+  %>% t()
+)
+  
+```
+
+#### Profile Starts
+
+```{r}
+profile_pts <- 10
+bcov_profile_starts_6 <- (
+  profile_design(
+    b_cov = seq(1, 200, length=profile_pts),
+    lower = bcov_prof_lik_params_6["min", ],
+    upper = bcov_prof_lik_params_6["max", ],
+    nprof = profile_Nreps
+  )
+  %>% select(
+    names(df_results_local_6 %>% select(-c(log_lik, log_lik_se)))
+  )
+)
+```
+
+#### Parameters random walk
+
+```{r}
+bcov_profile_rw.sd_6 <- rw_sd(
+  s_0 = ivp(rw.sd_ivp),
+  e_0 = ivp(rw.sd_ivp),
+  a_0 = ivp(rw.sd_ivp),
+  i_0 = ivp(rw.sd_ivp),
+  h_0 = ivp(rw.sd_ivp),
+  r_0 = ivp(rw.sd_ivp),
+  a_cov = rw.sd_rp,
+  b_cov = 0,
+  b_dis = rw.sd_rp,
+  eps_A = rw.sd_rp,
+  f_ai = rw.sd_rp,
+  f_h = rw.sd_rp,
+  mu_rs = rw.sd_rp,
+  rho = rw.sd_rp,
+  tau = rw.sd_rp,
+  b_idps = rw.sd_rp
+)
+```
+
+```{r}
+bcov_profile_params_6 <- foreach (start=iter(bcov_profile_starts_6, "row"), .combine=rbind) %dopar% {
+  mf <- (
+    mif2(
+      m_6,
+      params=unlist(start),
+      Np = Np,
+      Nmif = ceiling(Nmif/2),
+      cooling.fraction.50 = 0.5,
+      rw.sd = bcov_profile_rw.sd_6
+    )
+    %>% mif2(
+      cooling.fraction.50 = 0.1
+    )
+  )
+  ll <- (
+    replicate(
+      Nreps_eval,
+      (
+        mf 
+        %>% pfilter(Np=Np)
+        %>% logLik()
+      )
+    )
+    %>% logmeanexp(se=TRUE)
+  )
+  data.frame(
+    as.list(coef(mf)),
+    log_lik = ll[1],
+    log_lik_se = ll[2]
+  )
+}
+```
+
+#### Temp Save
+
+```{r}
+if (run_level > 0) {
+  append <- FALSE
+  col.names <- TRUE
+  row.names <- FALSE
+  if (file.exists(model_output_filename_6)) {
+    append <- TRUE
+    col.names <- FALSE
+  }
+  (
+    write.table(
+      bcov_profile_params_6 %>% select(names(df_results_local_6)), 
+      file = model_output_filename_6, 
+      append = append,
+      col.names = col.names,
+      row.names = row.names
+    )
+  )
+}
+```
+
+#### Diagnostic
+
+```{r}
+model_params_6 <- read.table(
+  model_output_filename_6,
+  row.names = NULL,
+  header = TRUE
+)
+```
+
+```{r}
+summary(model_params_6$log_lik, digits=5)
+```
+
+```{r}
+#| fig-height: 6
+#| fig-width: 6
+(
+  bcov_profile_params_6
+  %>% group_by(b_cov)
+  %>% summarise(
+    log_lik = mean(log_lik),
+    log_lik_se = mean(log_lik_se)
+  )
+  %>% filter(log_lik>max(log_lik) - 1000)
+  %>% ungroup()
+  %>% ggplot(
+    aes(x=b_cov, y=log_lik)
+  )
+  + geom_point()
+  + scale_x_continuous(limits=c(0, 500))
+)
+```
+
+```{r}
+#| fig-width: 12
+#| fig-asp: 1
+res_to_plot <- (
+  model_params_6
+  %>% filter(log_lik>max(log_lik) - 100)
+)
+pairs(
+  ~(
+    log_lik
+    +a_cov
+    +b_cov
+    +b_dis
+    +f_ai
+    +f_h
+    +eps_A
+    +mu_rs
+    +tau
+    +rho
+    +b_idps
+    +sigmaSE
+  ),
+  data=res_to_plot,
+)
+```
+
+### mu_rs Profiles
+
+#### Search Box
+
+```{r}
+murs_prof_lik_params_6 <- (
+  model_params_6
+  %>% filter(log_lik > max(log_lik) - 100)
+  %>% select(-c(log_lik, log_lik_se, mu_rs))
+  %>% gather(variable, value)
+  %>% group_by(variable)
+  %>% summarise(
+    min=min(value),
+    max=max(value)
+  )
+  %>% ungroup()
+  %>% column_to_rownames(
+    var="variable"
+  )
+  %>% t()
+)
+  
+```
+
+#### Profile Starts
+
+```{r}
+profile_pts <- 15
+murs_profile_starts_6 <- (
+  profile_design(
+    mu_rs = seq(1, 25, length=profile_pts),
+    lower = murs_prof_lik_params_6["min", ],
+    upper = murs_prof_lik_params_6["max", ],
+    nprof = profile_Nreps
+  )
+  %>% select(
+    names(df_results_local_6 %>% select(-c(log_lik, log_lik_se)))
+  )
+)
+```
+
+#### Parameters random walk
+
+```{r}
+murs_profile_rw.sd_6 <- rw_sd(
+  s_0 = ivp(rw.sd_ivp),
+  e_0 = ivp(rw.sd_ivp),
+  a_0 = ivp(rw.sd_ivp),
+  i_0 = ivp(rw.sd_ivp),
+  h_0 = ivp(rw.sd_ivp),
+  r_0 = ivp(rw.sd_ivp),
+  a_cov = rw.sd_rp,
+  b_cov = rw.sd_rp,
+  b_dis = rw.sd_rp,
+  eps_A = rw.sd_rp,
+  f_ai = rw.sd_rp,
+  f_h = rw.sd_rp,
+  mu_rs = 0,
+  rho = rw.sd_rp,
+  tau = rw.sd_rp,
+  b_idps = rw.sd_rp
+)
+```
+
+```{r}
+murs_profile_params_6 <- foreach (start=iter(murs_profile_starts_6, "row"), .combine=rbind) %dopar% {
+  mf <- (
+    mif2(
+      m_6,
+      params=unlist(start),
+      Np = Np,
+      Nmif = ceiling(Nmif/2),
+      cooling.fraction.50 = 0.5,
+      rw.sd = murs_profile_rw.sd_6
+    )
+    %>% mif2(
+      cooling.fraction.50 = 0.1
+    )
+  )
+  ll <- (
+    replicate(
+      Nreps_eval,
+      (
+        mf 
+        %>% pfilter(Np=Np)
+        %>% logLik()
+      )
+    )
+    %>% logmeanexp(se=TRUE)
+  )
+  data.frame(
+    as.list(coef(mf)),
+    log_lik = ll[1],
+    log_lik_se = ll[2]
+  )
+}
+```
+
+#### Temp Save
+
+```{r}
+if (run_level > 0) {
+  append <- FALSE
+  col.names <- TRUE
+  row.names <- FALSE
+  if (file.exists(model_output_filename_6)) {
+    append <- TRUE
+    col.names <- FALSE
+  }
+  (
+    write.table(
+      murs_profile_params_6 %>% select(names(df_results_local_6)), 
+      file = model_output_filename_6, 
+      append = append,
+      col.names = col.names,
+      row.names = row.names
+    )
+  )
+}
+```
+
+#### Diagnostic
+
+```{r}
+model_params_6 <- read.table(
+  model_output_filename_6,
+  row.names = NULL,
+  header = TRUE
+)
+```
+
+```{r}
+summary(model_params_6$log_lik, digits=5)
+```
+
+```{r}
+#| fig-height: 6
+#| fig-width: 6
+(
+  model_params_6
+  %>% group_by(mu_rs)
+  %>% summarise(
+    log_lik = mean(log_lik),
+    log_lik_se = mean(log_lik_se)
+  )
+  %>% filter(log_lik>max(log_lik) - 1000)
+  %>% ungroup()
+  %>% ggplot(
+    aes(x=mu_rs, y=log_lik)
+  )
+  + geom_point()
+  + scale_x_continuous(limits=c(0, 100))
+)
+```
+
+```{r}
+#| fig-width: 12
+#| fig-asp: 1
+res_to_plot <- (
+  model_params_6
+  %>% filter(log_lik>max(log_lik) - 100)
+)
+pairs(
+  ~(
+    log_lik
+    +a_cov
+    +b_cov
+    +b_dis
+    +f_ai
+    +f_h
+    +eps_A
+    +mu_rs
+    +tau
+    +rho
+    +b_idps
+  ),
+  data=res_to_plot,
+)
+```
+
+## Bayes Search
+
+### Prior Functions
+
+```{r}
+rprior_6 <- Csnippet("
+  s_0 = rbeta(1, 1);
+  e_0 = rbeta(1, 1);
+  a_0 = rbeta(1, 1);
+  i_0 = rbeta(1, 1);
+  h_0 = rbeta(1, 1);
+  r_0 = rbeta(1, 1);
+  a_cov = rgamma(a_cov_0, a_cov_1);
+  b_cov = rgamma(b_cov_0, b_cov_1);
+  b_dis = rgamma(b_dis_0, b_dis_1);
+  f_ai = rbeta(f_ai_0, f_ai_1);
+  f_h = rbeta(f_h_0, f_h_1);
+  eps_A = rbeta(eps_A_0, eps_A_1);
+  mu_rs = rgamma(mu_rs_0, mu_rs_1);
+  tau = rgamma(tau_0, tau_1);
+  rho = rbeta(rho_0, rho_1);
+  b_idps = rbeta(b_idps_0, b_idps_1);
+")
+
+dprior_6 <- Csnippet("
+  lik = (
+    dbeta(s_0, 1, 1, give_log)
+    + dbeta(e_0, 1, 1, give_log)
+    + dbeta(a_0, 1, 1, give_log)
+    + dbeta(i_0, 1, 1, give_log)
+    + dbeta(h_0, 1, 1, give_log)
+    + dbeta(r_0, 1, 1, give_log)
+    + dgamma(a_cov, a_cov_0, a_cov_1, give_log)
+    + dgamma(b_cov, b_cov_0, b_cov_1, give_log)
+    + dgamma(b_dis, b_dis_0, b_dis_1, give_log)
+    + dbeta(f_ai, f_ai_0, f_ai_1, give_log)
+    + dbeta(f_h, f_h_0, f_h_1, give_log)
+    + dbeta(eps_A, eps_A_0, eps_A_1, give_log)
+    + dgamma(mu_rs, mu_rs_0, mu_rs_1, give_log)
+    + dgamma(tau, tau_0, tau_1, give_log)
+    + dbeta(rho, rho_0, rho_1, give_log)
+    + dbeta(b_idps, b_idps_0, b_idps_1, give_log)
+  );
+  if (!give_log) lik = exp(lik);
+")
+```
+
+### Prior params
+
+```{r}
+test_x <- seq(0, 50, by=0.1)
+test_y <- dgamma(test_x, shape=4, scale=5)
+# test_y <- dexp(test_x, 1/100)
+plot(test_x, test_y)
+```
+
+```{r}
+test_x <- seq(0, 1, by=0.01)
+test_y <- dbeta(test_x, 1, 6)
+plot(test_x, test_y)
+```
+
+```{r}
+prior_params_6 <- c(
+  a_cov_0 = 3,
+  a_cov_1 = 200,
+  b_cov_0 = 3,
+  b_cov_1 = 200,
+  b_dis_0 = 1,
+  b_dis_1 = 1,
+  f_ai_0 = 2,
+  f_ai_1 = 2,
+  f_h_0 = 1,
+  f_h_1 = 6,
+  eps_A_0 = 2,
+  eps_A_1 = 6,
+  mu_rs_0 = 4,
+  mu_rs_1 = 5,
+  tau_0 = 2,
+  tau_1 = 1,
+  rho_0 = 6,
+  rho_1 = 2,
+  b_idps_0 = 1,
+  b_idps_1 = 6
+)
+```
+
+### Approximate modeling
+
+```{r}
+start <- Sys.time()
+bayes_start_coefs_6 <- model_params_6[which.max(model_params_6$log_lik),]
+m_bayes_6 <- (
+  m_6
+  %>% pomp(
+    rprior = rprior_6,
+    dprior = dprior_6,
+    paramnames = c(paramnames_6, names(prior_params_6)),
+    params = c(
+      bayes_start_coefs_6,
+      prior_params_6
+    )
+  )
+)
+m_bayesapprox_6 <- bsmc2(
+  data = m_bayes_6,
+  Np=20000
+)
+end <- Sys.time()
+sprintf("Run time of bsmc: %d minutes", as.integer(round(difftime(end, start, units='mins'))))
+```
+
+```{r}
+df_bayesapprox_6 <- (
+  m_bayesapprox_6
+  %>% as.data.frame()
+  %>% select(c(all_of(paramnames_6), .id))
+)
+```
+
+```{r}
+#| fig-width: 10
+#| fig-height: 10
+(
+  df_bayesapprox_6
+  %>% group_by(.id)
+  %>% slice_sample(n=1000)
+  %>% ungroup()
+  %>% mutate(
+    .id = factor(.id, levels=c("prior", "posterior")), 
+  )
+  %>% arrange(.id)
+  %>% ggpairs(
+    aes(color=.id, alpha=.id, fill=.id),
+    columns = names(global_guesses_6),
+    upper = list(continuous = "points"),
+    progress = FALSE,
+  )
+  + scale_color_manual(
+    values = c("posterior" = "cornflowerblue", "prior" = "lightgray"))
+  + scale_fill_manual(values = c("posterior" = "cornflowerblue", "prior" = "lightgray"))
+  + scale_alpha_manual(values = c("posterior" = 0.5, "prior" = 0.2))
+  + theme(
+    panel.background = element_blank(),
+    panel.border = element_rect(fill = NA, color = "black", linewidth = 1),
+    plot.background = element_blank(),
+    strip.background = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 8)
+  )
+)
+```
+
+#### Simulations from parameter posterior
+
+```{r}
+approx_post_samples_6 <- (
+  df_bayesapprox_6
+  %>% filter(.id == "posterior")
+  %>% select(-.id)
+  %>% sample_n(100)
+)
+```
+
+```{r}
+approx_post_sims_6 <- (
+  foreach (
+    sample=iter(approx_post_samples_6, "row"),
+    .combine=rbind
+  ) %dopar% {
+    (
+      m_6
+      %>% simulate(
+        nsim = 1,
+        params = unlist(sample),
+        format = "data.frame",
+        include.data = FALSE
+      )
+    )
+  }
+)
+```
+
+```{r}
+approx_post_sims_agg_6 <- (
+  approx_post_sims_6
+  %>% group_by(date)
+  %>% summarise(
+    reports_median = median(reports),
+    reports_10q = quantile(reports, 0.1),
+    reports_90q = quantile(reports, 0.9)
+  )
+)
+```
+
+```{r}
+#| fig-width: 10
+#| fig-height: 3
+(
+  ggplot()
+  + theme(
+    panel.background = element_blank(),
+    panel.border = element_rect(fill = NA, color = "black", linewidth = 1),
+    panel.grid = element_blank(),
+    plot.background = element_blank(),
+    plot.title = element_text(size = 16, hjust = 0.5),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12),
+  )
+  + geom_line(
+    data = df_model,
+    mapping = aes(x = date, y = reports), 
+    color = "black", 
+    linetype = "dashed"
+  )
+  + geom_line(
+      data = approx_post_sims_agg_6,
+      mapping = aes(x = date, y = reports_median), 
+      color = "cornflowerblue", 
+      linetype = "solid",
+      linewidth = 1
+  )
+  + geom_ribbon(
+    data = approx_post_sims_agg_6,
+    aes(x = date, ymin = reports_10q, ymax = reports_90q),
+    alpha=0.3,
+    fill = "cornflowerblue"
+  )
+  + scale_y_continuous(limits = c(0, 120))
+  + guides(color = "none")
+  + labs(
+    title = "Simulated and true reported cases - best Log Likelihood",
+    x = "Date",
+    y = "Counts"
+  )
+)
+```
+
+### PMCMC
+
+#### Proposal
+
+```{r}
+prop_logit <- 0.05
+bayes_sd_6 <- c(
+  s_0 = prop_logit,
+  e_0 = prop_logit,
+  a_0 = prop_logit,
+  i_0 = prop_logit,
+  r_0 = prop_logit,
+  a_cov = 20,
+  b_cov = 20,
+  b_dis = 10,
+  eps_A = prop_logit,
+  f_ai = prop_logit,
+  f_h = prop_logit,
+  mu_rs = prop_logit,
+  tau = prop_logit,
+  rho = prop_logit,
+  b_idps = prop_logit
+)
+```
+
+#### Run search
+
+```{r}
+start <- Sys.time()
+m_bayesfull_6 <- (
+  foreach (
+    i = 1:5, 
+    .combine = c
+  ) %dopar% {
+    pmcmc(
+      m_bayes_6,
+      # m_bayesapprox_6,
+      Nmcmc=5000, #Nbayes_iter,  # 40000
+      Np=100,
+      # proposal=mvn_diag_rw(bayes_sd_2)
+      proposal=mvn_rw_adaptive(
+        bayes_sd_6,
+        scale.start = 100,
+        scale.cooling = 0.95,
+        shape.start = 2000
+        # shape.start = 100
+      )
+    )
+  }
+)
+end <- Sys.time()
+as.integer(round(difftime(end, start, units='mins')))
+```
+
+```{r}
+#| fig-width: 12
+#| fig-asp: 1
+plot(
+  m_bayesfull_6,
+  pars = c(
+    "loglik",
+    "log.prior",
+    "a_cov",
+    "b_cov",
+    "b_dis",
+    "b_idps",
+    "f_ai",
+    "f_h",
+    "eps_A",
+    "mu_rs",
+    "tau",
+    "rho"
+  )
+)
+```
+
+```{r}
+datalist <- list()
+for (i in 1:length(m_bayes_2)) {
+  datalist[[i]] <- (
+    traces(m_bayes_2[[i]]) 
+    %>% as.data.frame() 
+    %>% select(paramnames_2)
+    %>% tail(1000)
+  )
+}
+df_bayes_2 <- bind_rows(datalist)
+```
+
+```{r}
+#| fig-width: 8
+#| fig-height: 8
+(
+  df_bayes_2
+  %>% ggpairs(
+    columns = names(global_guesses_2),
+    lower = "blank",
+    upper = list(continuous = wrap("points", alpha = 0.3)),
+    progress = FALSE,
+  )
+  + theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank()
+  )
+)
+```
+
+# With Covariate Modulation + IDPS + Vaccinations
+
+```{r}
+model_output_filename_2 <- file.path(output_dir, "uvira_multioutbreak_vacc_2.csv")
+```
+
+## Model Definition
+
+### Fixed Parameters
+
+```{r}
+N_0 <- uvira_pop_2016
+mu_latend <- 1 / ((5/7) / 52) # inverse of latent period (5 days transformed in weeks)
+mu_ar <- 1 / ((10/7) / 52) # inverse of asymptomatic period (10 days transformed in weeks)
+mu_ir <- 1 / ((10/7) / 52)  # inverse of infectious period (10 days transformed in weeks)
+
+fixed_params_2 <- c(
+  N_0 = N_0,
+  mu_latend = mu_latend,
+  mu_ar = mu_ar,
+  mu_ir = mu_ir
+)
+```
+
+### Initialization Function
+
+```{r}
+rinit_2 <- Csnippet("
+  double m = N_0/(s_0+e_0+a_0+i_0+r_0);
+  S = nearbyint(s_0*m);
+  E = nearbyint(e_0*m);
+  A = nearbyint(a_0*m);
+  I = nearbyint(i_0*m);
+  R = nearbyint(r_0*m);
+  N = S + E + A + I + R;
+  V1 = 0;
+  V2 = 0;
+  C = 0;
+  W = 0;
+")
+```
+
+### Step Function
+
+I'm assuming that getting vaccinated is similar to being infected so if you are already infected adding vaccination would not do much
+
+```{r}
+rproc_2 <- Csnippet("
+  double foi, births, hosp, dw;
+  int idps_scaled;
+  int SV1, RV1, AV1, S1S2;
+  double rate[17];
+  double trans[17];
+  double rate_idps[6];
+  int trans_idps[6];
+  
+  // idps
+  if (idps < 0) {
+    if (N > I) {
+      idps_scaled = floor(fmin((-idps * b_idps), (N-I)/10));
+      double s = (N-I) / (S + V1 + V2 + E + A + R);
+      rate_idps[0] = s*S/(N-I);
+      rate_idps[1] = s*V1/(N-I);
+      rate_idps[2] = s*V2/(N-I);
+      rate_idps[3] = s*E/(N-I);
+      rate_idps[4] = s*A/(N-I);
+      rate_idps[5] = s*R/(N-I);
+      rmultinom(idps_scaled, &rate_idps[0], 6, &trans_idps[0]);
+      S -= fmin(trans_idps[0], S);
+      V1 -= fmin(trans_idps[1], V1);
+      V2 -= fmin(trans_idps[2], V2);
+      E -= fmin(trans_idps[3], E);
+      A -= fmin(trans_idps[4], A);
+      R -= fmin(trans_idps[5], R);
+    }
+  }
+  if (idps > 0) {
+    idps_scaled = floor(fmin((idps * b_idps)/5, (N-I)/10));
+    trans_idps[0] = idps_scaled;
+    trans_idps[1] = 0;
+    trans_idps[2] = 0;
+    trans_idps[3] = idps_scaled;
+    trans_idps[4] = idps_scaled;
+    trans_idps[5] = idps_scaled;
+    S += trans_idps[0];
+    V1 += trans_idps[1];
+    V2 += trans_idps[2];
+    E += trans_idps[3];
+    A += trans_idps[4];
+    R += trans_idps[5];
+  }
+  
+  N = S + V1 + V2 + E + A + I + R;
+  
+  
+  // Vaccination
+  if (vacc_prop > 0) {
+    SV1 = rbinom(S, vacc_prop);
+    RV1 = rbinom(R, vacc_prop);
+    AV1 = rbinom(A, vacc_prop);
+    S1S2 = rbinom(V1, vacc_prop);
+    S -= SV1;
+    R -= RV1;
+    A -= AV1;
+    V1 += SV1 + RV1 + AV1 - S1S2;
+    V2 += S1S2;
+  }
+  
+  // Poisson births
+  births = rpois(birthrate * N * dt);
+  
+  // expected force of infection
+  foi = (a_cov + b_cov * cov + b_dis * dis)*(I + eps_A * A)/N;
+
+  // white noise (extrademographic stochasticity)
+  dw = rgammawn(sigmaSE,dt);
+  
+  rate[0] = foi*dw/dt;  // stochastic force of infection
+  //rate[0] = foi;  // stochastic force of infection
+  rate[1] = deathrate;        // natural death rate
+  rate[2] = mu_latend * f_ai;      // transition to asymp
+  rate[3] = mu_latend * (1 - f_ai); // transition to symp
+  rate[4] = deathrate;        // natural death rate
+  rate[5] = mu_ar;       // asymp -> recovery
+  rate[6] = deathrate;        // natural death rate
+  rate[7] = mu_ir;       // symp -> recovered
+  rate[8] = deathrate;        // natural death rate
+  rate[9] = mu_rs;       // recovered -> susceptible
+  rate[10] = deathrate;        // natural death rate
+  rate[11] = f_vacc_1 * foi;
+  rate[12] = mu_vacc_1;
+  rate[13] = deathrate;
+  rate[14] = f_vacc_2 * foi;
+  rate[15] = mu_vacc_2;
+  rate[16] = deathrate;
+  
+  // transitions between compartments
+  reulermultinom(2, S, &rate[0], dt, &trans[0]);
+  reulermultinom(3, E, &rate[2], dt, &trans[2]);
+  reulermultinom(2, A, &rate[5], dt, &trans[5]);
+  reulermultinom(2, I, &rate[7], dt, &trans[7]);
+  reulermultinom(2, R, &rate[9], dt, &trans[9]);
+  reulermultinom(3, V1, &rate[11], dt, &trans[11]);
+  reulermultinom(3, V2, &rate[14], dt, &trans[14]);
+  
+  S += births - trans[0] - trans[1] + trans[9] + trans[12];
+  E += trans[0] - trans[2] - trans[3] - trans[4];
+  A += trans[2] - trans[5] - trans[6] + trans[11] + trans[14];
+  I += trans[3] - trans[7] - trans[8];
+  R += trans[5] + trans[7] - trans[9] - trans[10];
+  V1 += trans[15] - trans[11] - trans[12] - trans[13];
+  V2 += -trans[14] - trans[15] - trans[16];
+  
+    // Measured
+  C += trans[3];
+  
+  // Noise
+  W += (dw - dt)/sigmaSE;  
+  
+  N = S + V1 + V2 + E + A + I + R;
+")
+```
+
+```{r}
+rproc_1 <- Csnippet("
+  double foi, births, hosp, dw;
+  double idps_scaled;
+  double rate[20];
+  double trans[20];
+  double rate_idps[6];
+  int trans_idps[6];
+  
+  // idps
+  if (idps < 0) {
+    if (N > I) {
+      idps_scaled = floor(fmin((-idps * b_idps), (N-I)/10));
+      double s = (N-I) / (S + V1 + V2 + E + A + R);
+      rate_idps[0] = s*S/(N-I);
+      rate_idps[1] = s*V1/(N-I);
+      rate_idps[2] = s*V2/(N-I);
+      rate_idps[3] = s*E/(N-I);
+      rate_idps[4] = s*A/(N-I);
+      rate_idps[5] = s*R/(N-I);
+      rmultinom(idps_scaled, &rate_idps[0], 6, &trans_idps[0]);
+      S -= fmin(trans_idps[0], S);
+      V1 -= fmin(trans_idps[1], V1);
+      V2 -= fmin(trans_idps[2], V2);
+      E -= fmin(trans_idps[3], E);
+      A -= fmin(trans_idps[4], A);
+      R -= fmin(trans_idps[5], R);
+    }
+  }
+  if (idps > 0) {
+    idps_scaled = floor(fmin((idps * b_idps)/5, (N-I)/10));
+    trans_idps[0] = idps_scaled;
+    trans_idps[1] = 0;
+    trans_idps[2] = 0;
+    trans_idps[3] = idps_scaled;
+    trans_idps[4] = idps_scaled;
+    trans_idps[5] = idps_scaled;
+    S += trans_idps[0];
+    V1 += trans_idps[1];
+    V2 += trans_idps[2];
+    E += trans_idps[3];
+    A += trans_idps[4];
+    R += trans_idps[5];
+  }
+  
+  N = S + V1 + V2 + E + A + I + H + R;
+  
+  // Poisson births
+  births = rpois(birthrate * N * dt);
+  
+  // expected force of infection
+  foi = (a_cov + b_cov * cov + b_dis * dis)*(I + eps_A * A)/N;
+
+  // white noise (extrademographic stochasticity)
+  dw = rgammawn(sigmaSE,dt);
+  
+  rate[0] = foi*dw/dt;  // stochastic force of infection
+  //rate[0] = foi;  // stochastic force of infection
+  rate[1] = vacc_prop * 365; // vaccination
+  rate[2] = deathrate;        // natural death rate
+  rate[3] = mu_latend * f_ai;      // transition to asymp
+  rate[4] = mu_latend * (1 - f_ai); // transition to symp
+  rate[5] = deathrate;        // natural death rate
+  rate[6] = mu_ar;       // asymp -> recovery
+  rate[7] = vacc_prop * 365; // vaccination
+  rate[8] = deathrate;        // natural death rate
+  rate[9] = mu_ir;       // symp -> recovered
+  rate[10] = deathrate;        // natural death rate
+  rate[11] = mu_rs;       // recovered -> susceptible
+  rate[12] = vacc_prop * 365; //vaccination
+  rate[13] = deathrate;        // natural death rate
+  rate[14] = vacc_prop * 365;
+  rate[15] = f_vacc_1 * foi;
+  rate[16] = mu_vacc_1;
+  rate[17] = deathrate;
+  rate[18] = f_vacc_2 * foi;
+  rate[19] = mu_vacc_2;
+  rate[20] = deathrate;
+  
+  // transitions between classes
+  reulermultinom(3, S, &rate[0], dt, &trans[0]);
+  reulermultinom(3, E, &rate[3], dt, &trans[3]);
+  reulermultinom(3, A, &rate[6], dt, &trans[6]);
+  reulermultinom(2, I, &rate[9], dt, &trans[9]);
+  reulermultinom(3, R, &rate[11], dt, &trans[11]);
+  reulermultinom(4, V1, &rate[14], dt, &trans[14]);
+  reulermultinom(3, V2, &rate[20], dt, &trans[20]);
+  
+  S += births - trans[0] - trans[1] - trans[2] + trans[13] + trans[18];
+  E += trans[0] - trans[3] - trans[4] - trans[5] - trans[6];
+  A += trans[3] - trans[7] - trans[8] + trans[17] + trans[20];
+  I += trans[4] - trans[9] - trans[10];
+  H += trans[5] - trans[11] - trans[12];
+  R += trans[7] + trans[9] + trans[11] - trans[13] - trans[14] - trans[15];
+  V1 += trans[1] + trans[14] + trans[21] - trans[16] - trans[17] - trans[18] - trans[19];
+  V2 += trans[16] - trans[20] - trans[21] - trans[22];
+
+  // Measured
+  C += trans[5];
+  
+  // Noise
+  W += (dw - dt)/sigmaSE;  
+  
+  N = S + V1 + V2 + E + A + I + H + R;
+")
+```
+
+  
+
+```{r}
+rproc_1 <- Csnippet("
+  double foi, births, hosp, dw;
+  double idps_scaled;
+  double rate[23];
+  double trans[23];
+  double rate_idps[7];
+  int trans_idps[7];
+  
+  // idps
+  if (idps < 0) {
+    if (N > H) {
+      idps_scaled = floor(fmin((-idps * b_idps), (N-H)/10));
+      double s = (N-H) / (S + S_1 + S_2 + E + A + I + R);
+      rate_idps[0] = s*S/(N-H);
+      rate_idps[1] = s*S_1/(N-H);
+      rate_idps[2] = s*S_2/(N-H);
+      rate_idps[3] = s*E/(N-H);
+      rate_idps[4] = s*A/(N-H);
+      rate_idps[5] = s*I/(N-H);
+      rate_idps[6] = s*R/(N-H);  //1 - rate_idps[0] - rate_idps[1] - rate_idps[2] - rate_idps[3] - rate_idps[4] - rate_idps[5];
+      rmultinom(idps_scaled, &rate_idps[0], 7, &trans_idps[0]);
+      S -= fmin(trans_idps[0], S);
+      S_1 -= fmin(trans_idps[1], S_1);
+      S_2 -= fmin(trans_idps[2], S_2);
+      E -= fmin(trans_idps[3], E);
+      A -= fmin(trans_idps[4], A);
+      I -= fmin(trans_idps[5], I);
+      R -= fmin(trans_idps[6], R);
+    }
+  }
+  if (idps > 0) {
+    idps_scaled = floor(fmin((idps * b_idps), (N-H)/10));
+    trans_idps[0] = idps_scaled;
+    trans_idps[1] = 0;
+    trans_idps[2] = 0;
+    trans_idps[3] = idps_scaled;
+    trans_idps[4] = idps_scaled;
+    trans_idps[5] = idps_scaled;
+    trans_idps[6] = idps_scaled;
+    S += trans_idps[0];
+    S_1 += trans_idps[1];
+    S_2 += trans_idps[2];
+    E += trans_idps[3];
+    A += trans_idps[4];
+    I += trans_idps[5];
+    R += trans_idps[6];
+  }
+  
+  N = S + S_1 + S_2 + E + A + I + H + R;
+  
+  // Poisson births
+  births = rpois(birthrate * N * dt);
+  
+  // expected force of infection
+  foi = (a_cov + b_cov * cov + b_dis * dis)*(I + eps_A * A)/N;
+
+  // white noise (extrademographic stochasticity)
+  dw = rgammawn(sigmaSE,dt);
+  
+  // hospitalization rate
+  hosp = f_h * (1/(1 + H/N));
+  
+  rate[0] = foi*dw/dt;  // stochastic force of infection
+  //rate[0] = foi;  // stochastic force of infection
+  rate[1] = vacc_1_prop * 365; // vaccination
+  rate[2] = deathrate;        // natural death rate
+  rate[3] = mu_latend * f_ai;      // transition to asymp
+  rate[4] = mu_latend * (1 - f_ai) * (1 - hosp); // transition to symp
+  rate[5] = mu_latend * (1 - f_ai) * hosp; // transition to hospitalized
+  rate[6] = deathrate;        // natural death rate
+  rate[7] = mu_ar;       // asymp -> recovery
+  rate[8] = deathrate;        // natural death rate
+  rate[9] = mu_ir;       // symp -> recovered
+  rate[10] = deathrate;        // natural death rate
+  rate[11] = mu_hr;       // hospitalized -> recovered
+  rate[12] = deathrate;        // natural death rate
+  rate[13] = mu_rs;       // recovered -> susceptible
+  rate[14] = vacc_1_prop * 365; //vaccination
+  rate[15] = deathrate;        // natural death rate
+  rate[16] = vacc_2_prop * 365;
+  rate[17] = f_vacc_1 * foi;
+  rate[18] = mu_vacc_1;
+  rate[19] = deathrate;
+  rate[20] = f_vacc_2 * foi;
+  rate[21] = mu_vacc_2;
+  rate[22] = deathrate;
+  
+  // transitions between classes
+  reulermultinom(3, S, &rate[0], dt, &trans[0]);
+  reulermultinom(4, E, &rate[3], dt, &trans[3]);
+  reulermultinom(2, A, &rate[7], dt, &trans[7]);
+  reulermultinom(2, I, &rate[9], dt, &trans[9]);
+  reulermultinom(2, H, &rate[11], dt, &trans[11]);
+  reulermultinom(3, R, &rate[13], dt, &trans[13]);
+  reulermultinom(4, S_1, &rate[16], dt, &trans[16]);
+  reulermultinom(3, S_2, &rate[20], dt, &trans[20]);
+  
+  S += births - trans[0] - trans[1] - trans[2] + trans[13] + trans[18];
+  E += trans[0] - trans[3] - trans[4] - trans[5] - trans[6];
+  A += trans[3] - trans[7] - trans[8] + trans[17] + trans[20];
+  I += trans[4] - trans[9] - trans[10];
+  H += trans[5] - trans[11] - trans[12];
+  R += trans[7] + trans[9] + trans[11] - trans[13] - trans[14] - trans[15];
+  S_1 += trans[1] + trans[14] + trans[21] - trans[16] - trans[17] - trans[18] - trans[19];
+  S_2 += trans[16] - trans[20] - trans[21] - trans[22];
+
+  // Measured
+  C += trans[5];
+  
+  // Noise
+  W += (dw - dt)/sigmaSE;  
+  
+  N = S + S_1 + S_2 + E + A + I + H + R;
+")
+```
+
+### Observation Function
+
+```{r}
+dmeas_2 <- Csnippet("
+  double f;
+  double tol = 1.0e-25;
+  if (tau > 0.0) {
+    f = dnbinom_mu(nearbyint(reports), 1.0/tau, rho*C, give_log) + tol;
+  }
+  else {
+    f = dpois(nearbyint(reports), rho*C, give_log) + tol;
+  }
+  lik = (give_log) ? f : exp(f);
+")
+
+
+# dmeas_6 <- Csnippet("
+#   double tol = 1.0e-25;
+#   double mean_reports = rho*C;
+#   double sd_reports = sqrt(pow(tau*C,2) + mean_reports);
+#   if(reports > 0.0){
+#     lik = pnorm(reports+0.5,mean_reports,sd_reports,1,0)
+#       - pnorm(reports-0.5,mean_reports,sd_reports,1,0) + tol;
+#   } else{
+#     lik = pnorm(reports+0.5,mean_reports,sd_reports,1,0) + tol;
+#   }
+#   if (give_log) lik = log(lik);
+# ")
+
+rmeas_2 <- Csnippet("
+  if (tau > 0.0) {
+    reports = rnbinom_mu(1.0/tau, rho*C);
+  }
+  else {
+    reports = rpois(rho*C);
+  }
+")
+
+# rmeas_6 <- Csnippet("
+#   reports = rnorm(rho*C, sqrt( pow(tau*C,2) + rho*C ) );
+#   if (reports > 0.0) {
+#     reports = nearbyint(reports);
+#   } else {
+#     reports = 0.0;
+#  }")
+
+```
+
+## Initial parameter estimates
+
+```{r}
+
+# a_cov_guess <- 17.0393
+# b_cov_guess <- 69.6589
+# eps_A_guess <- 0.731113
+# f_ai_guess <- 0.926581
+# f_h_guess <- 0.828567
+# mu_rs_guess <- 1 / ((150/7) / 52) # inverse of immunity period (50 days transformed in weeks)
+# rho_guess <- 0.9
+# s_0_guess <- 0.245589
+# h_0_guess <- 0.119584
+# i_0_guess <- 0.285245 #min(floor(H_0_guess / (1 - exp(-mu_ih_guess))), N_0)
+# a_0_guess <- 0.19815 #min(floor(f_ai_guess/(1 - f_ai_guess) * I_0_guess), N_0)
+# e_0_guess <- 0.0463198 #min(floor((A_0_guess + I_0_guess) / (1 - exp(-mu_latend_guess))), N_0)
+# r_0_guess <- 0.105113
+# tau_guess <- 0.002
+# b_idps_guess <- 0.99
+# b_dis_guess <- 10
+# sigmaSE_guess <- 0.05
+# f_vacc_1_guess <- 0.838041
+# f_vacc_2_guess <- 0.170122
+# mu_vacc_1_guess <- 0.630433
+# mu_vacc_2_guess <- 11.4946
+      
+a_cov_guess <- 40
+b_cov_guess <- 120
+eps_A_guess <- 0.08
+f_ai_guess <- 0.55
+mu_rs_guess <- 1 / ((150/7) / 52) # inverse of immunity period (50 days transformed in weeks)
+rho_guess <- 0.1
+s_0_guess <- 0.55
+i_0_guess <- 0.005 #min(floor(H_0_guess / (1 - exp(-mu_ih_guess))), N_0)
+a_0_guess <- 0.01 #min(floor(f_ai_guess/(1 - f_ai_guess) * I_0_guess), N_0)
+e_0_guess <- 0.02 #min(floor((A_0_guess + I_0_guess) / (1 - exp(-mu_latend_guess))), N_0)
+r_0_guess <- max(1 - s_0_guess - e_0_guess - a_0_guess - i_0_guess - h_0_guess, 0)
+tau_guess <- 0.002
+b_idps_guess <- 0.05
+b_dis_guess <- 1
+sigmaSE_guess <- 0.05
+f_vacc_1_guess <- 0.1
+f_vacc_2_guess <- 0.1
+mu_vacc_1_guess <- 1 / ((365/7) / 52) # inverse of immunity period
+mu_vacc_2_guess <- 1 / ((365/7) / 52) # inverse of immunity period
+
+init_params_2 <- c(
+  fixed_params_2,
+  sigmaSE = sigmaSE_guess,
+  f_vacc_1 = f_vacc_1_guess,
+  f_vacc_2 = f_vacc_2_guess,
+  mu_vacc_1 = mu_vacc_1_guess,
+  mu_vacc_2 = mu_vacc_2_guess,
+  s_0 = s_0_guess,
+  e_0 = e_0_guess,
+  a_0 = a_0_guess,
+  i_0 = i_0_guess,
+  r_0 = r_0_guess,
+  a_cov = a_cov_guess,
+  b_cov = b_cov_guess,
+  eps_A = eps_A_guess,
+  f_ai = f_ai_guess,
+  mu_rs = mu_rs_guess,
+  rho = rho_guess,
+  tau = tau_guess,
+  b_dis = b_dis_guess,
+  b_idps = b_idps_guess
+)
+```
+
+## POMP object
+
+```{r}
+statenames_2 <- c(
+  "S", 
+  "V1",
+  "V2",
+  "E", 
+  "A", 
+  "I", 
+  "R", 
+  "C",
+  "W",
+  "N"
+)
+obsnames_2 <- "reports"
+covar_2 <- covariate_table(
+  df_covar %>% select(c(date, cov, dis, idps, birthrate, deathrate, vacc_prop)),
+  times="date"
+)
+covarnames_2 <- c(
+  "cov", 
+  "dis",
+  "idps",
+  "birthrate", 
+  "deathrate",
+  "vacc_prop"
+)
+rp_names_log_2 <- c(
+  "sigmaSE",
+  "a_cov",
+  "b_cov",
+  "b_dis",
+  "mu_rs",
+  "mu_vacc_1",
+  "mu_vacc_2",
+  "tau"
+)
+rp_names_logit_2 <- c(
+  "f_ai",
+  "eps_A",
+  "b_idps",
+  "f_vacc_1",
+  "f_vacc_2",
+  "rho"
+)
+ivp_names_2 <- c(
+  "s_0",
+  "e_0",
+  "a_0",
+  "i_0",
+  "r_0"
+)
+
+paramnames_2 <- c(rp_names_log_2, rp_names_logit_2, ivp_names_2, names(fixed_params_2))
+accumvars_2 <- c(
+  "C",
+  "W"
+)
+partrans_2 <- parameter_trans(
+  log=rp_names_log_2,
+  logit=rp_names_logit_2,
+  barycentric=ivp_names_2
+)
+
+m_2 <- (
+  df_model
+  %>% select(date, reports)
+  %>% pomp(
+    times = "date",
+    t0 = df_covar$date[1],
+    rprocess = euler(
+      step.fun = rproc_2,
+      delta.t = 1/52/7
+    ),
+    rinit = rinit_2,
+    rmeasure = rmeas_2,
+    dmeasure = dmeas_2,
+    obsnames = obsnames_2,
+    covar = covar_2,
+    covarnames = covarnames_2,
+    accumvars = accumvars_2,
+    statenames = statenames_2,
+    paramnames = paramnames_2,
+    partrans = partrans_2,
+    params = init_params_2
+  )
+)
+```
+
+## Simulations
+
+```{r}
+sims_2 <- (
+  m_2
+  %>% simulate(
+    nsim = 20,
+    format = "data.frame",
+    include.data = TRUE
+  )
+)
+```
+
+```{r}
+pf_sim_2 <- pfilter(m_2, Np = 1000)
+lk_sim_2 <- logLik(pf_sim_2)
+lk_sim_2
+```
+
+```{r}
+#| fig-height: 10
+(
+  sims_2
+  %>% filter(.id == 1)
+  %>% select(
+    date, 
+    S,
+    V1,
+    V2,
+    E,
+    A,
+    I,
+    C,
+    R,
+    W,
+    N
+  )
+  %>% pivot_longer(
+    cols = -date,
+    names_to = "compartment",
+    values_to = "counts"
+  )
+  %>% ggplot(
+    aes(x = date, y = counts, color = compartment)
+  )
+  + facet_wrap(~compartment, scales = "free_y", ncol = 3)
+  + theme(
+    panel.background = element_blank(),
+    panel.border = element_rect(fill = NA, color = "black", linewidth = 1),
+    panel.grid = element_blank(),
+    strip.text = element_text(size = 20),
+    plot.background = element_blank(),
+    plot.title = element_text(size = 16, hjust = 0.5),
+    axis.title = element_text(size = 20),
+    axis.text = element_text(size = 18),
+  )
+  + geom_line()
+  + guides(color = "none")
+)
+```
+
+```{r}
+(sims_2 %>% filter(.id == 7))$R
+```
+
+```{r}
+(
+  sims_2 
+  %>% filter(.id == 1) 
+  %>% slice(seq(195, 210, 1))
+  %>% select(
+    date,
+    idps,
+    S,
+    V1,
+    V2,
+    E,
+    A,
+    I,
+    R,
+    N
+  )
+)
+```
+
+```{r}
+#| fig-width: 4.5
+#| fig-height: 3
+(
+  sims_2
+  %>% mutate(
+    date = as.Date("2016-01-01") + 52 * date
+  )
+  %>% ggplot(
+    aes(x = date, y = reports, group=.id, color=.id=="data")
+  )
+  + theme(
+    panel.background = element_blank(),
+    panel.border = element_rect(fill = NA, color = "black", linewidth = 1),
+    panel.grid = element_blank(),
+    plot.background = element_blank(),
+    plot.title = element_text(size = 16, hjust = 0.5),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12),
+  )
+  + geom_line()
+  + guides(color = "none")
+  + labs(
+    title = "Simulated and true reported cases",
+    x = "Date",
+    y = "Counts"
+  )
+)
+ggsave(filename = "test_pomp_simulation.png", path = img_dir)
+```
+
+## Local Search
+
+```{r}
+# Parameters 
+rw.sd_rp <- 0.02
+rw.sd_ivp <- 0.2
+cooling.fraction.50 <- 0.5 # Level of parameter variance after 50% of iterations
+rw.sd_2 <- rw_sd(
+  s_0 = ivp(rw.sd_ivp),
+  e_0 = ivp(rw.sd_ivp),
+  a_0 = ivp(rw.sd_ivp),
+  i_0 = ivp(rw.sd_ivp),
+  r_0 = ivp(rw.sd_ivp),
+  sigmaSE = rw.sd_rp,
+  f_vacc_1 = rw.sd_rp,
+  f_vacc_2 = rw.sd_rp,
+  mu_vacc_1 = rw.sd_rp,
+  mu_vacc_2 = rw.sd_rp,
+  a_cov = rw.sd_rp,
+  b_cov = rw.sd_rp,
+  b_dis = rw.sd_rp,
+  b_idps = rw.sd_rp,
+  f_ai = rw.sd_rp,
+  eps_A = rw.sd_rp,
+  mu_rs = rw.sd_rp,
+  rho = rw.sd_rp,
+  tau = rw.sd_rp
+)
+```
+
+### Run Iterated Particle Filter
+
+```{r}
+start <- Sys.time()
+m_local_2 <- foreach (
+  i=1:Nreps_local, 
+  .combine=c 
+) %dopar% {
+  init_params_2[rp_names_log_2] <- rlnorm(
+    n=length(rp_names_log_2), 
+    meanlog=log(init_params_2[rp_names_log_2]),
+    sdlog=1
+  )
+  init_params_2[c(rp_names_logit_2, ivp_names_2)] <- runif(
+    n=length(c(rp_names_logit_2, ivp_names_2)),
+    min=0.01,
+    max=0.99
+  )
+  (
+    mif2(
+      m_2,
+      Np=Np,
+      Nmif=Nmif,
+      params=init_params_2,
+      cooling.fraction.50 = cooling.fraction.50,
+      rw.sd=rw.sd_2
+    )
+  )
+}
+end <- Sys.time()
+sprintf("Run time of local iterated particle filter: %d minutes", as.integer(round(difftime(end, start, units='mins'))))
+```
+
+```{r}
+loglik_local_all_2 <- foreach(
+  mf = m_local_2,
+  .combine=rbind
+) %dopar% {
+  pf <- replicate(
+    n = Nreps_eval,
+    logLik(pfilter(mf, Np = Np))
+  )
+  logmeanexp(pf, se = TRUE)
+}
+```
+
+Focus on the highest estimated likelihood to get MLE
+
+```{r}
+m_local_mle_2 <- m_local_2[[which.max(loglik_local_all_2[,1])]]
+params_local_2 <- coef(m_local_mle_2)
+loglik_local_best_2 <- logmeanexp(
+  replicate(
+    n = Nreps_eval,
+    logLik(pfilter(m_local_mle_2, Np = 1000))
+  ),
+  se = TRUE
+)
+```
+
+```{r}
+loglik_local_best_2
+```
+
+### Collect Results
+
+```{r}
+df_results_local_2 <- data.frame(
+  t(sapply(m_local_2, coef)),
+  log_lik=loglik_local_all_2[,1],
+  log_lik_se=loglik_local_all_2[,2]
+)
+```
+
+### Temp Save
+
+```{r}
+if (run_level > 0) {
+  append <- FALSE
+  col.names <- TRUE
+  row.names <- FALSE
+  if (file.exists(model_output_filename_2)) {
+    append <- TRUE
+    col.names <- FALSE
+  }
+  (
+    write.table(
+      df_results_local_2, 
+      file = model_output_filename_2, 
+      append = append,
+      col.names = col.names,
+      row.names = row.names
+    )
+  )
+}
+```
+
+### Diagnostics
+
+```{r}
+model_params_2 <- read.table(
+  model_output_filename_2,
+  row.names = NULL,
+  header = TRUE
+)
+```
+
+#### Summary
+
+```{r}
+summary(model_params_2$log_lik, digits = 5)
+```
+
+#### Pair plot
+
+```{r}
+(
+  m_local_2
+  %>% traces()
+  %>% melt()
+  %>% filter(!name %in% c(names(fixed_params_2), ivp_names_2))
+  %>% ggplot(
+    aes(
+      x=iteration,
+      y=value,
+      group=.L1,
+      color=factor(.L1)
+    )
+  )
+  + geom_line()
+  + guides(color="none")
+  + facet_wrap(~name, scales="free_y")
+)
+```
+
+```{r}
+#| fig-width: 12
+#| fig-asp: 1
+data_to_plot <- (
+  model_params_2
+  %>% filter(!is.na(log_lik))
+  %>% filter(log_lik > max(log_lik) - 100)
+)
+
+pairs(
+  ~(
+    log_lik
+    +a_cov
+    +b_cov
+    +b_dis
+    +f_ai
+    +eps_A
+    +mu_rs
+    +tau
+    +rho
+    +f_vacc_1
+    +f_vacc_2
+    +mu_vacc_1
+    +mu_vacc_2
+    +sigmaSE
+  ),
+  data=data_to_plot
+)
+```
+
+## Global Search
+
+### Search box
+
+```{r}
+s_0_guesses <- runif(Nreps_global, min = 0.01, max = 0.99)
+e_0_guesses <- runif(Nreps_global, min = 0.01, max = 0.99)
+a_0_guesses <- runif(Nreps_global, min = 0.01, max = 0.99)
+i_0_guesses <- runif(Nreps_global, min = 0.01, max = 0.99)
+r_0_guesses <- runif(Nreps_global, min = 0.01, max = 0.99)
+a_cov_guesses <- runif(Nreps_global, min = 0, max = 100)
+b_cov_guesses <- runif(Nreps_global, min = 2, max = 200)
+b_dis_guesses <- runif(Nreps_global, min = 0, max = 50)
+b_idps_guesses <- runif(Nreps_global, min = 0, max = 1)
+eps_A_guesses <- runif(Nreps_global, min = 0.01, max = 0.5)
+f_ai_guesses <- runif(Nreps_global, min = 0.1, max = 0.99)
+mu_rs_guesses <- runif(Nreps_global, min = 1e-3, max = 50)
+f_vacc_1_guesses <- runif(Nreps_global, min = 0.01, max = 0.99)
+f_vacc_2_guesses <- runif(Nreps_global, min = 0.01, max = 0.99)
+mu_vacc_1_guesses <- runif(Nreps_global, min = 1e-3, max = 100)
+mu_vacc_2_guesses <- runif(Nreps_global, min = 1e-3, max = 100)
+rho_guesses <- runif(Nreps_global, min = 0.01, max = 1)
+tau_guesses <- runif(Nreps_global, min = 1e-4, max = 5)
+sigmaSE_guesses <- runif(Nreps_global, min = 0.01, max = 0.2)
+
+
+global_guesses_2 <- as.data.frame(cbind(
+  s_0 = s_0_guesses,
+  e_0 = e_0_guesses,
+  a_0 = a_0_guesses,
+  i_0 = i_0_guesses,
+  r_0 = r_0_guesses,
+  sigmaSE = sigmaSE_guesses,
+  a_cov = a_cov_guesses,
+  b_cov = b_cov_guesses,
+  b_dis = b_dis_guesses,
+  b_idps = b_idps_guesses,
+  eps_A = eps_A_guesses,
+  f_ai = f_ai_guesses,
+  mu_rs = mu_rs_guesses,
+  f_vacc_1 = f_vacc_1_guesses,
+  f_vacc_2 = f_vacc_2_guesses,
+  mu_vacc_1 = mu_vacc_1_guesses,
+  mu_vacc_2 = mu_vacc_2_guesses,
+  tau = tau_guesses,
+  rho = rho_guesses
+))
+```
+
+### Run Iterated Particle Filter
+
+```{r}
+start <- Sys.time()
+m_global_2 <- foreach (guess=iter(global_guesses_2, "row"), .combine=c) %dopar% {
+  (
+    m_local_mle_2
+    %>% mif2(Nmif=Nmif, params=c(fixed_params_2, unlist(guess)))
+    %>% mif2(Nmif=Nmif, cooling.fraction.50 = 0.1)
+  )
+}
+end <- Sys.time()
+sprintf("Run time of global iterated particle filter: %d minutes", as.integer(round(difftime(end, start, units='mins'))))
+```
+
+```{r}
+loglik_global_all_2 <- (
+  foreach(
+    i=1:Nreps_global,
+    .combine=rbind
+  ) %dopar% {
+    logmeanexp(
+      replicate(
+        Nreps_eval,
+        logLik(pfilter(m_2, params=coef(m_global_2[[i]]), Np=1000))
+      ),
+      se=TRUE
+    )
+  }
+)
+```
+
+### Collect Results
+
+```{r}
+df_results_global_2 <- (
+  data.frame(
+    t(sapply(m_global_2, coef)),
+    log_lik=loglik_global_all_2[,1],
+    log_lik_se=loglik_global_all_2[,2]
+  )
+  %>% select(
+    names(df_results_local_2)
+  )
+)
+```
+
+### Temp Save
+
+```{r}
+if (run_level > 0) {
+  append <- FALSE
+  col.names <- TRUE
+  row.names <- FALSE
+  if (file.exists(model_output_filename_2)) {
+    append <- TRUE
+    col.names <- FALSE
+  }
+  (
+    write.table(
+      df_results_global_2, 
+      file = model_output_filename_2, 
+      append = append,
+      col.names = col.names,
+      row.names = row.names
+    )
+  )
+}
+```
+
+### Diagnostic
+
+```{r}
+model_params_2 <- read.table(
+  model_output_filename_2,
+  row.names = NULL,
+  header = TRUE
+)
+```
+
+#### Summary
+
+```{r}
+summary(model_params_2$log_lik, digits=5)
+```
+
+#### Pair plot
+
+```{r}
+#| fig-width: 12
+#| fig-asp: 1
+res_to_plot <- (
+  model_params_2
+  %>% filter(!is.na(log_lik))
+  %>% filter((log_lik>max(log_lik) - 100))
+  %>% bind_rows(global_guesses_2)
+  %>% mutate(
+    type = if_else(is.na(log_lik), "guess", "result")
+  )
+  %>% arrange(type)
+)
+pairs(
+  ~(
+    log_lik
+    +a_cov
+    +b_cov
+    +b_dis
+    +f_ai
+    +eps_A
+    +mu_rs
+    +tau
+    +rho
+    +f_vacc_1
+    +f_vacc_2
+    +mu_vacc_1
+    +mu_vacc_2
+    +sigmaSE
+  ),
+  data=res_to_plot,
+  col=ifelse(res_to_plot$type == "guess", grey(0.5), "red")
+)
+```
+
+#### Simulations from best model
+
+```{r}
+sort(loglik_global_all_2[,1], decreasing = TRUE)
+```
+
+```{r}
+sims_global_best_ll_2 <- (
+  m_global_2[[which(rank(-loglik_global_all_2[,1]) == 1)]]
+  %>% simulate(
+    nsim = 100,
+    format = "data.frame",
+    include.data = TRUE
+  )
+)
+sims_global_best_ll_agg_2 <- (
+  sims_global_best_ll_2
+  %>% filter(.id != "data")
+  %>% select(.id, date, reports)
+  %>% group_by(date)
+  %>% summarise(
+    reports_mean = mean(reports),
+    reports_median = median(reports),
+    reports_10q = quantile(reports, 0.1),
+    reports_90q = quantile(reports, 0.9)
+  )
+)
+
+sims_global_best_sd_2 <- (
+  m_global_2[[which.min(loglik_global_all_2[,2])]]
+  %>% simulate(
+    nsim = 100,
+    format = "data.frame",
+    include.data = TRUE
+  )
+)
+sims_global_best_sd_agg_2 <- (
+  sims_global_best_sd_2
+  %>% filter(.id != "data")
+  %>% select(.id, date, reports)
+  %>% group_by(date)
+  %>% summarise(
+    reports_mean = mean(reports),
+    reports_median = median(reports),
+    reports_10q = quantile(reports, 0.1),
+    reports_90q = quantile(reports, 0.9)
+  )
+)
+```
+
+```{r}
+#| fig-width: 10
+#| fig-height: 6
+p1 <- (
+  ggplot()
+  + theme(
+    panel.background = element_blank(),
+    panel.border = element_rect(fill = NA, color = "black", linewidth = 1),
+    panel.grid = element_blank(),
+    plot.background = element_blank(),
+    plot.title = element_text(size = 16, hjust = 0.5),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12),
+  )
+  + geom_line(
+    data = df_model,
+    mapping = aes(x = date, y = reports), 
+    color = "black", 
+    linetype = "dashed"
+  )
+  + geom_line(
+      data = sims_global_best_ll_agg_2,
+      mapping = aes(x = date, y = reports_mean), 
+      color = "firebrick", 
+      linetype = "solid",
+      linewidth = 1
+  )
+  + geom_line(
+      data = sims_global_best_ll_agg_2,
+      mapping = aes(x = date, y = reports_median), 
+      color = "cornflowerblue", 
+      linetype = "solid",
+      linewidth = 1
+  )
+  + geom_ribbon(
+    data = sims_global_best_ll_agg_2,
+    aes(x = date, ymin = reports_10q, ymax = reports_90q),
+    alpha=0.3,
+    fill = "cornflowerblue"
+  )
+  + guides(color = "none")
+  + labs(
+    title = "Simulated and true reported cases - best Log Likelihood",
+    x = "Date",
+    y = "Counts"
+  )
+)
+p2 <- (
+  ggplot()
+  + theme(
+    panel.background = element_blank(),
+    panel.border = element_rect(fill = NA, color = "black", linewidth = 1),
+    panel.grid = element_blank(),
+    plot.background = element_blank(),
+    plot.title = element_text(size = 16, hjust = 0.5),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12),
+  )
+  + geom_line(
+    data = df_model,
+    mapping = aes(x = date, y = reports), 
+    color = "black", 
+    linetype = "dashed"
+  )
+  + geom_line(
+      data = sims_global_best_sd_agg_2,
+      mapping = aes(x = date, y = reports_mean), 
+      color = "firebrick", 
+      linetype = "solid",
+      linewidth = 1
+  )
+  + geom_line(
+      data = sims_global_best_sd_agg_2,
+      mapping = aes(x = date, y = reports_median), 
+      color = "cornflowerblue", 
+      linetype = "solid",
+      linewidth = 1
+  )
+  + geom_ribbon(
+    data = sims_global_best_sd_agg_2,
+    aes(x = date, ymin = reports_10q, ymax = reports_90q),
+    alpha=0.3,
+    fill = "cornflowerblue"
+  )
+  + guides(color = "none")
+  + labs(
+    title = "Simulated and true reported cases - best SD",
+    x = "Date",
+    y = "Counts"
+  )
+)
+p1/p2
+```
+
+```{r}
+coef(m_global_2[[which(rank(-loglik_global_all_2[,1]) == 1)]])
+```
+
+```{r}
+#| fig-width: 10
+#| fig-height: 10
+(
+  sims_global_best_ll_2
+  %>% filter(.id == 2)
+  %>% select(
+    date, 
+    S, 
+    V1,
+    V2,
+    E, 
+    A, 
+    I, 
+    C,
+    R, 
+    W,
+    N
+  )
+  %>% pivot_longer(
+    cols = -date,
+    names_to = "compartment",
+    values_to = "counts"
+  )
+  %>% ggplot(
+    aes(x = date, y = counts, color = compartment)
+  )
+  + facet_wrap(~compartment, scales = "free_y", ncol = 3)
+  + geom_line()
+  + guides(color = "none")
+  + theme(
+    panel.background = element_blank(),
+    panel.border = element_rect(fill = NA, color = "black", linewidth = 1),
+    panel.grid = element_blank(),
+    plot.background = element_blank(),
+    plot.title = element_text(size = 16, hjust = 0.5),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12),
+  )
+  + labs(
+    x = "Date",
+    y = "Counts"
+  )
+)
+```
+
+## Profile Likelihood
+
+### b_cov Profiles
+
+#### Search Box
+
+```{r}
+bcov_prof_lik_params_6 <- (
+  model_params_6
+  %>% filter(log_lik > max(log_lik) - 100)
+  %>% select(-c(log_lik, log_lik_se, b_cov))
+  %>% gather(variable, value)
+  %>% group_by(variable)
+  %>% summarise(
+    min=min(value),
+    max=max(value)
+  )
+  %>% ungroup()
+  %>% column_to_rownames(
+    var="variable"
+  )
+  %>% t()
+)
+  
+```
+
+#### Profile Starts
+
+```{r}
+profile_pts <- 10
+bcov_profile_starts_6 <- (
+  profile_design(
+    b_cov = seq(1, 200, length=profile_pts),
+    lower = bcov_prof_lik_params_6["min", ],
+    upper = bcov_prof_lik_params_6["max", ],
+    nprof = profile_Nreps
+  )
+  %>% select(
+    names(df_results_local_6 %>% select(-c(log_lik, log_lik_se)))
+  )
+)
+```
+
+#### Parameters random walk
+
+```{r}
+bcov_profile_rw.sd_6 <- rw_sd(
+  s_0 = ivp(rw.sd_ivp),
+  e_0 = ivp(rw.sd_ivp),
+  a_0 = ivp(rw.sd_ivp),
+  i_0 = ivp(rw.sd_ivp),
+  h_0 = ivp(rw.sd_ivp),
+  r_0 = ivp(rw.sd_ivp),
+  a_cov = rw.sd_rp,
+  b_cov = 0,
+  b_dis = rw.sd_rp,
+  eps_A = rw.sd_rp,
+  f_ai = rw.sd_rp,
+  f_h = rw.sd_rp,
+  mu_rs = rw.sd_rp,
+  rho = rw.sd_rp,
+  tau = rw.sd_rp,
+  b_idps = rw.sd_rp
+)
+```
+
+```{r}
+bcov_profile_params_6 <- foreach (start=iter(bcov_profile_starts_6, "row"), .combine=rbind) %dopar% {
+  mf <- (
+    mif2(
+      m_6,
+      params=unlist(start),
+      Np = Np,
+      Nmif = ceiling(Nmif/2),
+      cooling.fraction.50 = 0.5,
+      rw.sd = bcov_profile_rw.sd_6
+    )
+    %>% mif2(
+      cooling.fraction.50 = 0.1
+    )
+  )
+  ll <- (
+    replicate(
+      Nreps_eval,
+      (
+        mf 
+        %>% pfilter(Np=Np)
+        %>% logLik()
+      )
+    )
+    %>% logmeanexp(se=TRUE)
+  )
+  data.frame(
+    as.list(coef(mf)),
+    log_lik = ll[1],
+    log_lik_se = ll[2]
+  )
+}
+```
+
+#### Temp Save
+
+```{r}
+if (run_level > 0) {
+  append <- FALSE
+  col.names <- TRUE
+  row.names <- FALSE
+  if (file.exists(model_output_filename_6)) {
+    append <- TRUE
+    col.names <- FALSE
+  }
+  (
+    write.table(
+      bcov_profile_params_6 %>% select(names(df_results_local_6)), 
+      file = model_output_filename_6, 
+      append = append,
+      col.names = col.names,
+      row.names = row.names
+    )
+  )
+}
+```
+
+#### Diagnostic
+
+```{r}
+model_params_6 <- read.table(
+  model_output_filename_6,
+  row.names = NULL,
+  header = TRUE
+)
+```
+
+```{r}
+summary(model_params_6$log_lik, digits=5)
+```
+
+```{r}
+#| fig-height: 6
+#| fig-width: 6
+(
+  bcov_profile_params_6
+  %>% group_by(b_cov)
+  %>% summarise(
+    log_lik = mean(log_lik),
+    log_lik_se = mean(log_lik_se)
+  )
+  %>% filter(log_lik>max(log_lik) - 1000)
+  %>% ungroup()
+  %>% ggplot(
+    aes(x=b_cov, y=log_lik)
+  )
+  + geom_point()
+  + scale_x_continuous(limits=c(0, 500))
+)
+```
+
+```{r}
+#| fig-width: 12
+#| fig-asp: 1
+res_to_plot <- (
+  model_params_6
+  %>% filter(log_lik>max(log_lik) - 100)
+)
+pairs(
+  ~(
+    log_lik
+    +a_cov
+    +b_cov
+    +b_dis
+    +f_ai
+    +f_h
+    +eps_A
+    +mu_rs
+    +tau
+    +rho
+    +b_idps
+    +sigmaSE
+  ),
+  data=res_to_plot,
+)
+```
+
+### mu_rs Profiles
+
+#### Search Box
+
+```{r}
+murs_prof_lik_params_6 <- (
+  model_params_6
+  %>% filter(log_lik > max(log_lik) - 100)
+  %>% select(-c(log_lik, log_lik_se, mu_rs))
+  %>% gather(variable, value)
+  %>% group_by(variable)
+  %>% summarise(
+    min=min(value),
+    max=max(value)
+  )
+  %>% ungroup()
+  %>% column_to_rownames(
+    var="variable"
+  )
+  %>% t()
+)
+  
+```
+
+#### Profile Starts
+
+```{r}
+profile_pts <- 15
+murs_profile_starts_6 <- (
+  profile_design(
+    mu_rs = seq(1, 25, length=profile_pts),
+    lower = murs_prof_lik_params_6["min", ],
+    upper = murs_prof_lik_params_6["max", ],
+    nprof = profile_Nreps
+  )
+  %>% select(
+    names(df_results_local_6 %>% select(-c(log_lik, log_lik_se)))
+  )
+)
+```
+
+#### Parameters random walk
+
+```{r}
+murs_profile_rw.sd_6 <- rw_sd(
+  s_0 = ivp(rw.sd_ivp),
+  e_0 = ivp(rw.sd_ivp),
+  a_0 = ivp(rw.sd_ivp),
+  i_0 = ivp(rw.sd_ivp),
+  h_0 = ivp(rw.sd_ivp),
+  r_0 = ivp(rw.sd_ivp),
+  a_cov = rw.sd_rp,
+  b_cov = rw.sd_rp,
+  b_dis = rw.sd_rp,
+  eps_A = rw.sd_rp,
+  f_ai = rw.sd_rp,
+  f_h = rw.sd_rp,
+  mu_rs = 0,
+  rho = rw.sd_rp,
+  tau = rw.sd_rp,
+  b_idps = rw.sd_rp
+)
+```
+
+```{r}
+murs_profile_params_6 <- foreach (start=iter(murs_profile_starts_6, "row"), .combine=rbind) %dopar% {
+  mf <- (
+    mif2(
+      m_6,
+      params=unlist(start),
+      Np = Np,
+      Nmif = ceiling(Nmif/2),
+      cooling.fraction.50 = 0.5,
+      rw.sd = murs_profile_rw.sd_6
+    )
+    %>% mif2(
+      cooling.fraction.50 = 0.1
+    )
+  )
+  ll <- (
+    replicate(
+      Nreps_eval,
+      (
+        mf 
+        %>% pfilter(Np=Np)
+        %>% logLik()
+      )
+    )
+    %>% logmeanexp(se=TRUE)
+  )
+  data.frame(
+    as.list(coef(mf)),
+    log_lik = ll[1],
+    log_lik_se = ll[2]
+  )
+}
+```
+
+#### Temp Save
+
+```{r}
+if (run_level > 0) {
+  append <- FALSE
+  col.names <- TRUE
+  row.names <- FALSE
+  if (file.exists(model_output_filename_6)) {
+    append <- TRUE
+    col.names <- FALSE
+  }
+  (
+    write.table(
+      murs_profile_params_6 %>% select(names(df_results_local_6)), 
+      file = model_output_filename_6, 
+      append = append,
+      col.names = col.names,
+      row.names = row.names
+    )
+  )
+}
+```
+
+#### Diagnostic
+
+```{r}
+model_params_6 <- read.table(
+  model_output_filename_6,
+  row.names = NULL,
+  header = TRUE
+)
+```
+
+```{r}
+summary(model_params_6$log_lik, digits=5)
+```
+
+```{r}
+#| fig-height: 6
+#| fig-width: 6
+(
+  model_params_6
+  %>% group_by(mu_rs)
+  %>% summarise(
+    log_lik = mean(log_lik),
+    log_lik_se = mean(log_lik_se)
+  )
+  %>% filter(log_lik>max(log_lik) - 1000)
+  %>% ungroup()
+  %>% ggplot(
+    aes(x=mu_rs, y=log_lik)
+  )
+  + geom_point()
+  + scale_x_continuous(limits=c(0, 100))
+)
+```
+
+```{r}
+#| fig-width: 12
+#| fig-asp: 1
+res_to_plot <- (
+  model_params_6
+  %>% filter(log_lik>max(log_lik) - 100)
+)
+pairs(
+  ~(
+    log_lik
+    +a_cov
+    +b_cov
+    +b_dis
+    +f_ai
+    +f_h
+    +eps_A
+    +mu_rs
+    +tau
+    +rho
+    +b_idps
+  ),
+  data=res_to_plot,
+)
+```
+
+## Bayes Search
+
+### Prior Functions
+
+```{r}
+rprior_6 <- Csnippet("
+  s_0 = rbeta(1, 1);
+  e_0 = rbeta(1, 1);
+  a_0 = rbeta(1, 1);
+  i_0 = rbeta(1, 1);
+  h_0 = rbeta(1, 1);
+  r_0 = rbeta(1, 1);
+  a_cov = rgamma(a_cov_0, a_cov_1);
+  b_cov = rgamma(b_cov_0, b_cov_1);
+  b_dis = rgamma(b_dis_0, b_dis_1);
+  f_ai = rbeta(f_ai_0, f_ai_1);
+  f_h = rbeta(f_h_0, f_h_1);
+  eps_A = rbeta(eps_A_0, eps_A_1);
+  mu_rs = rgamma(mu_rs_0, mu_rs_1);
+  tau = rgamma(tau_0, tau_1);
+  rho = rbeta(rho_0, rho_1);
+  b_idps = rbeta(b_idps_0, b_idps_1);
+")
+
+dprior_6 <- Csnippet("
+  lik = (
+    dbeta(s_0, 1, 1, give_log)
+    + dbeta(e_0, 1, 1, give_log)
+    + dbeta(a_0, 1, 1, give_log)
+    + dbeta(i_0, 1, 1, give_log)
+    + dbeta(h_0, 1, 1, give_log)
+    + dbeta(r_0, 1, 1, give_log)
+    + dgamma(a_cov, a_cov_0, a_cov_1, give_log)
+    + dgamma(b_cov, b_cov_0, b_cov_1, give_log)
+    + dgamma(b_dis, b_dis_0, b_dis_1, give_log)
+    + dbeta(f_ai, f_ai_0, f_ai_1, give_log)
+    + dbeta(f_h, f_h_0, f_h_1, give_log)
+    + dbeta(eps_A, eps_A_0, eps_A_1, give_log)
+    + dgamma(mu_rs, mu_rs_0, mu_rs_1, give_log)
+    + dgamma(tau, tau_0, tau_1, give_log)
+    + dbeta(rho, rho_0, rho_1, give_log)
+    + dbeta(b_idps, b_idps_0, b_idps_1, give_log)
+  );
+  if (!give_log) lik = exp(lik);
+")
+```
+
+### Prior params
+
+```{r}
+test_x <- seq(0, 50, by=0.1)
+test_y <- dgamma(test_x, shape=4, scale=5)
+# test_y <- dexp(test_x, 1/100)
+plot(test_x, test_y)
+```
+
+```{r}
+test_x <- seq(0, 1, by=0.01)
+test_y <- dbeta(test_x, 1, 6)
+plot(test_x, test_y)
+```
+
+```{r}
+prior_params_6 <- c(
+  a_cov_0 = 3,
+  a_cov_1 = 200,
+  b_cov_0 = 3,
+  b_cov_1 = 200,
+  b_dis_0 = 1,
+  b_dis_1 = 1,
+  f_ai_0 = 2,
+  f_ai_1 = 2,
+  f_h_0 = 1,
+  f_h_1 = 6,
+  eps_A_0 = 2,
+  eps_A_1 = 6,
+  mu_rs_0 = 4,
+  mu_rs_1 = 5,
+  tau_0 = 2,
+  tau_1 = 1,
+  rho_0 = 6,
+  rho_1 = 2,
+  b_idps_0 = 1,
+  b_idps_1 = 6
+)
+```
+
+### Approximate modeling
+
+```{r}
+start <- Sys.time()
+bayes_start_coefs_6 <- model_params_6[which.max(model_params_6$log_lik),]
+m_bayes_6 <- (
+  m_6
+  %>% pomp(
+    rprior = rprior_6,
+    dprior = dprior_6,
+    paramnames = c(paramnames_6, names(prior_params_6)),
+    params = c(
+      bayes_start_coefs_6,
+      prior_params_6
+    )
+  )
+)
+m_bayesapprox_6 <- bsmc2(
+  data = m_bayes_6,
+  Np=20000
+)
+end <- Sys.time()
+sprintf("Run time of bsmc: %d minutes", as.integer(round(difftime(end, start, units='mins'))))
+```
+
+```{r}
+df_bayesapprox_6 <- (
+  m_bayesapprox_6
+  %>% as.data.frame()
+  %>% select(c(all_of(paramnames_6), .id))
+)
+```
+
+```{r}
+#| fig-width: 10
+#| fig-height: 10
+(
+  df_bayesapprox_6
+  %>% group_by(.id)
+  %>% slice_sample(n=1000)
+  %>% ungroup()
+  %>% mutate(
+    .id = factor(.id, levels=c("prior", "posterior")), 
+  )
+  %>% arrange(.id)
+  %>% ggpairs(
+    aes(color=.id, alpha=.id, fill=.id),
+    columns = names(global_guesses_6),
+    upper = list(continuous = "points"),
+    progress = FALSE,
+  )
+  + scale_color_manual(
+    values = c("posterior" = "cornflowerblue", "prior" = "lightgray"))
+  + scale_fill_manual(values = c("posterior" = "cornflowerblue", "prior" = "lightgray"))
+  + scale_alpha_manual(values = c("posterior" = 0.5, "prior" = 0.2))
+  + theme(
+    panel.background = element_blank(),
+    panel.border = element_rect(fill = NA, color = "black", linewidth = 1),
+    plot.background = element_blank(),
+    strip.background = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 8)
+  )
+)
+```
+
+#### Simulations from parameter posterior
+
+```{r}
+approx_post_samples_6 <- (
+  df_bayesapprox_6
+  %>% filter(.id == "posterior")
+  %>% select(-.id)
+  %>% sample_n(100)
+)
+```
+
+```{r}
+approx_post_sims_6 <- (
+  foreach (
+    sample=iter(approx_post_samples_6, "row"),
+    .combine=rbind
+  ) %dopar% {
+    (
+      m_6
+      %>% simulate(
+        nsim = 1,
+        params = unlist(sample),
+        format = "data.frame",
+        include.data = FALSE
+      )
+    )
+  }
+)
+```
+
+```{r}
+approx_post_sims_agg_6 <- (
+  approx_post_sims_6
+  %>% group_by(date)
+  %>% summarise(
+    reports_median = median(reports),
+    reports_10q = quantile(reports, 0.1),
+    reports_90q = quantile(reports, 0.9)
+  )
+)
+```
+
+```{r}
+#| fig-width: 10
+#| fig-height: 3
+(
+  ggplot()
+  + theme(
+    panel.background = element_blank(),
+    panel.border = element_rect(fill = NA, color = "black", linewidth = 1),
+    panel.grid = element_blank(),
+    plot.background = element_blank(),
+    plot.title = element_text(size = 16, hjust = 0.5),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12),
+  )
+  + geom_line(
+    data = df_model,
+    mapping = aes(x = date, y = reports), 
+    color = "black", 
+    linetype = "dashed"
+  )
+  + geom_line(
+      data = approx_post_sims_agg_6,
+      mapping = aes(x = date, y = reports_median), 
+      color = "cornflowerblue", 
+      linetype = "solid",
+      linewidth = 1
+  )
+  + geom_ribbon(
+    data = approx_post_sims_agg_6,
+    aes(x = date, ymin = reports_10q, ymax = reports_90q),
+    alpha=0.3,
+    fill = "cornflowerblue"
+  )
+  + scale_y_continuous(limits = c(0, 120))
+  + guides(color = "none")
+  + labs(
+    title = "Simulated and true reported cases - best Log Likelihood",
+    x = "Date",
+    y = "Counts"
+  )
+)
+```
+
+# Benchmarks
+
+## Negative binomial IID Model
+
+```{r}
+nb_lik <- function(tau) {
+  -sum(
+    dnbinom(
+      as.vector(obs(m_6)),
+      size = exp(tau[1]),
+      prob = exp(tau[2]),
+      log = TRUE
+    )
+  )
+}
+```
+
+```{r}
+nb_mle <- optim(c(0, -5), nb_lik)
+```
+
+```{r}
+-nb_mle$value
+```
+
+## ARMA model
+
+```{r}
+log_y <- log(as.vector(obs(m_6)) + 1)
+arma_fit <- arima(
+  log_y,
+  order=c(2, 0, 2),
+  seasonal=list(
+    order=c(1, 0, 1),
+    period=52
+  )
+)
+```
+
+```{r}
+arma_fit$loglik - sum(log_y)
+```
