@@ -27,12 +27,17 @@ registerDoParallel(n_cores)
 registerDoRNG(seed)
 
 # Folder Structure
-root <- has_file("Oxford-Cholera.Rproj")$make_fix_file()
+root <- has_file("cholera-surveillance.Rproj")$make_fix_file()
 raw_data_dir <- root("data/raw")
 proc_data_dir <- root("data/processed")
 output_dir <- root("models_output/pomp")
 dir.create(output_dir, showWarnings = FALSE)
 img_dir <- root("images")
+src_dir <- root("src")
+
+# Local Packages
+utils <- new.env()
+source(file.path(src_dir, "model_builder.R"), local=utils)
 ```
 
 # Functions
@@ -226,6 +231,12 @@ df_covar <- (
 )
 ```
 
+```{r}
+cat(utils$model_builder(
+  data = df_full
+))
+```
+
 # With Covariate Modulation + IDPS + Hospitalized + Vaccinations
 
 ```{r}
@@ -412,10 +423,6 @@ rproc_1 <- Csnippet("
   N = S + V1 + V2 + E + A + I + H + R;
 ")
 ```
-
-
-
-  
 
 ```{r}
 rproc_1 <- Csnippet("
@@ -2413,8 +2420,6 @@ rproc_1 <- Csnippet("
   N = S + V1 + V2 + E + A + I + H + R;
 ")
 ```
-
-  
 
 ```{r}
 rproc_1 <- Csnippet("
