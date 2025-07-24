@@ -37,42 +37,9 @@ dir.create(img_dir, showWarnings = FALSE)
 src_dir <- root("src")
 
 # Local Packages
-utils <- new.env()
-source(file.path(src_dir, "model_builder.R"), local=utils)
+model_builder <- new.env()
+source(file.path(src_dir, "model_builder_new_vacc.R"), local=model_builder)
 ```
-
-```{r}
-m <- utils$model_builder(
-  data = df_full,
-  scale_infectious = FALSE,
-  use_cov = TRUE,
-  use_cov_regression = FALSE,
-  use_separate_recovery = FALSE,
-  add_hospitalized = TRUE,
-  add_idps = TRUE,
-  add_vaccination = TRUE,
-  add_disasters = TRUE
-)
-  
-```
-
-
-```{r}
-cat(
-  utils$model_builder(
-    data = df_full,
-    scale_infectious = FALSE,
-    use_cov = TRUE,
-    use_cov_regression = FALSE,
-    use_separate_recovery = FALSE,
-    add_hospitalized = TRUE,
-    add_idps = TRUE,
-    add_vaccination = TRUE,
-    add_disasters = TRUE
-  )
-)
-```
-
 
 # Functions
 
@@ -94,6 +61,10 @@ symlog <- function(x) {
     }
   }
   return(symlogx)
+}
+
+normalize <- function(x) {
+  (x - min(x)) / (max(x) - min(x))
 }
 ```
 
@@ -120,7 +91,8 @@ uvira_pop_2016 <- (
 # df_reports_cov_shap_train
 df_reports <- (
   read_csv(
-    file.path(proc_data_dir, "uvira_chol_cov_week_20250402.csv", fsep = "/"),
+    # file.path(proc_data_dir, "uvira_chol_cov_week_20250402.csv", fsep = "/"),
+    file.path(proc_data_dir, "uvira_chol_cov_week_20250506.csv", fsep = "/"),
     show_col_types = FALSE
   )
   %>% mutate(
@@ -128,6 +100,13 @@ df_reports <- (
     cov = cov - min(cov),
     idps = replace_na(idps, 0) / 7, # We bring this back to daily numbers to match the time step
     dis = num_disaster_affected / max(num_disaster_affected),
+    cov_1 = normalize(rainfall_mm_sum_8w),
+    cov_2 = normalize(esi__abs_energy),
+    cov_3 = normalize(rainfall_mm__count_above_mean),
+    cov_4 = normalize(lake_level__fourier_entropy__bins_3),
+    cov_5 = normalize(spei__mean_change),
+    cov_6 = normalize(esi__variance_larger_than_standard_deviation),
+    cov_7 = normalize(lake_level__mean_abs_change),
   )
   %>% select(
     date,
@@ -136,13 +115,13 @@ df_reports <- (
     idps,
     dis,
     cov,
-    cov_1 = rainfall_mm__maximum,
-    cov_2 = esi__median,
-    cov_3 = 'esi__change_quantiles__f_agg_\"mean\"__isabs_False__qh_0.4__ql_0.0',
-    cov_4 = esi__max_langevin_fixed_point__m_3__r_30,
-    cov_5 = 'num_fatalities__change_quantiles__f_agg_\"var\"__isabs_False__qh_1.0__ql_0.4',
-    cov_6 = lake_level__autocorrelation__lag_3,
-    cov_7 = num_fatalities__benford_correlation,
+    cov_1,
+    cov_2,
+    cov_3,
+    cov_4,
+    cov_5,
+    cov_6,
+    cov_7,
     vacc_1_prop,
     vacc_2_prop
   )
@@ -155,7 +134,7 @@ plot(df_reports$date, df_reports$cov_7, type = "l", col = "black")
 ```
 
 ```{r}
-plot(df_reports$date, 15 + 250*df_reports$cov, type = "l", col = "black")
+plot(df_reports$date, df_reports$cov, type = "l", col = "black")
 ```
 
 ```{r}
@@ -245,7 +224,7 @@ df_model <- (
 df_covar <- (
   df_full
   %>% select(
-    "date", 
+    date, 
     birthrate, 
     deathrate, 
     cov, 
@@ -520,6 +499,11 @@ m_1 <- (
 )
 ```
 
+```{r}
+test <- coef(m_1)
+test[which(names(test) %in% c("N_0", "mu_latend"))]
+```
+
 ## Simulations
 
 ```{r}
@@ -769,7 +753,6 @@ pairs(
 ### Search box
 
 ```{r}
-global_search_start_1 <- coef(m_local_mle_1)
 s_0_guesses <- runif(Nreps_global, min = 0.01, max = 0.99)
 e_0_guesses <- runif(Nreps_global, min = 0.01, max = 0.99)
 a_0_guesses <- runif(Nreps_global, min = 0.01, max = 0.99)
@@ -1464,16 +1447,16 @@ rinit_2 <- Csnippet("
   R = nearbyint(r_0*m);
   N = S + E + A + I + R;
   C = 0;
-  W = 0;
+  //W = 0;
 ")
 ```
 
-  ### Step Function
+\### Step Function
 
 ```{r}
 rproc_2 <- Csnippet("
-  //double foi, births;
-  double foi, births, dw;
+  double foi, births;
+  //double foi, births, dw;
   double rate[11];
   double trans[11];
 
@@ -1484,10 +1467,10 @@ rproc_2 <- Csnippet("
   foi = (a_cov + b_cov * cov)*(I + eps_A * A)/N;
   
   // white noise (extrademographic stochasticity)
-  dw = rgammawn(sigmaSE,dt);
+  //dw = rgammawn(sigmaSE,dt);
 
-  //rate[0] = foi;  // stochastic force of infection
-  rate[0] = foi*dw/dt;  // stochastic force of infection
+  rate[0] = foi;  // stochastic force of infection
+  //rate[0] = foi*dw/dt;  // stochastic force of infection
   rate[1] = deathrate;        // natural death rate
   rate[2] = mu_latend * f_ai;      // transition to asymp
   rate[3] = mu_latend * (1 - f_ai); // transition to symp
@@ -1516,7 +1499,7 @@ rproc_2 <- Csnippet("
   C += trans[3];
   
   // Noise
-  W += (dw - dt)/sigmaSE; 
+  //W += (dw - dt)/sigmaSE;
 
   N = S + E + A + I + R;
 ")
@@ -1538,56 +1521,56 @@ rproc_2 <- Csnippet("
 #   if (give_log) lik = log(lik);
 # ")
 
-dmeas_2 <- Csnippet("
-  double mean_reports = rho*C;
-  double sd_reports = sqrt(pow(tau*(C+reports)/2,2) + mean_reports);
-  if (reports > 0.0) {
-    lik = pnorm(reports+0.5,mean_reports,sd_reports,1,0)
-      - pnorm(reports-0.5,mean_reports,sd_reports,1,0);
-  }
-  else{
-    lik = pnorm(reports+0.5,mean_reports,sd_reports,1,0);
-  }
-  if (give_log) lik = log(lik);
-")
-
 # dmeas_2 <- Csnippet("
-#   double f;
-#   if (tau > 0.0) {
-#     f = dnbinom_mu(nearbyint(reports), 1.0/tau, rho*C, give_log);
+#   double mean_reports = rho*C;
+#   double sd_reports = sqrt(pow(tau*(C+reports)/2,2) + mean_reports);
+#   if (reports > 0.0) {
+#     lik = pnorm(reports+0.5,mean_reports,sd_reports,1,0)
+#       - pnorm(reports-0.5,mean_reports,sd_reports,1,0);
 #   }
-#   else {
-#     f = dpois(nearbyint(reports), rho*C, give_log);
+#   else{
+#     lik = pnorm(reports+0.5,mean_reports,sd_reports,1,0);
 #   }
-#   lik = (give_log) ? f : exp(f);
+#   if (give_log) lik = log(lik);
 # ")
+
+dmeas_2 <- Csnippet("
+  double f;
+  if (tau > 0.0) {
+    f = dnbinom_mu(nearbyint(reports), 1.0/tau, rho*C, give_log);
+  }
+  else {
+    f = dpois(nearbyint(reports), rho*C, give_log);
+  }
+  lik = (give_log) ? f : exp(f);
+")
 
 ####################################################
 
-rmeas_2 <- Csnippet("
-  reports = rnorm(rho*C, sqrt(pow(tau*C,2) + rho*C));
-  if (reports > 0.0) {
-    reports = nearbyint(reports);
-  } else {
-    reports = 0.0;
-  }")
-
-
 # rmeas_2 <- Csnippet("
-#   if (tau > 0.0) {
-#     reports = rnbinom_mu(1.0/tau, rho*C);
-#   }
-#   else {
-#     reports = rpois(rho*C);
-#   }
-# ")
+#   reports = rnorm(rho*C, sqrt(pow(tau*C,2) + rho*C));
+#   if (reports > 0.0) {
+#     reports = nearbyint(reports);
+#   } else {
+#     reports = 0.0;
+#   }")
+
+
+rmeas_2 <- Csnippet("
+  if (tau > 0.0) {
+    reports = rnbinom_mu(1.0/tau, rho*C);
+  }
+  else {
+    reports = rpois(rho*C);
+  }
+")
 ```
 
 ## Initial parameter estimates
 
 ```{r}
 # initial guesses
-sigmaSE_guess <- 0.01
+# sigmaSE_guess <- 0.01
 a_cov_guess <- 50
 b_cov_guess <- 200
 eps_A_guess <- 0.08
@@ -1603,6 +1586,7 @@ tau_guess <- 0.01
 
 init_params_2 <- c(
   fixed_params_2,
+  # sigmaSE = sigmaSE_guess,
   s_0 = s_0_guess,
   e_0 = e_0_guess,
   a_0 = a_0_guess,
@@ -1614,8 +1598,7 @@ init_params_2 <- c(
   f_ai = f_ai_guess,
   mu_rs = mu_rs_guess,
   tau = tau_guess,
-  rho = rho_guess,
-  sigmaSE = sigmaSE_guess
+  rho = rho_guess
 )
 ```
 
@@ -1629,7 +1612,7 @@ statenames_2 <- c(
   "I",
   "R", 
   "C",
-  "W",
+  # "W",
   "N"
 )
 obsnames_2 <- "reports"
@@ -1644,7 +1627,7 @@ covarnames_2 <- c(
   "dis"
 )
 rp_names_log_2 <- c(
-  "sigmaSE",
+  # "sigmaSE",
   "a_cov",
   "b_cov",
   "tau",
@@ -1664,8 +1647,8 @@ ivp_names_2 <- c(
 )
 paramnames_2 <- c(rp_names_log_2, rp_names_logit_2, ivp_names_2, names(fixed_params_2))
 accumvars_2 <- c(
-  "C",
-  "W"
+  "C"
+  # "W"
 )
 partrans_2 <- parameter_trans(
   log=rp_names_log_2,
@@ -1730,7 +1713,7 @@ lk_sim_2
     C,
     R,
     N,
-    W
+    # W
   )
   %>% pivot_longer(
     cols = -date,
@@ -1789,14 +1772,14 @@ rw.sd_2 <- rw_sd(
   a_0 = ivp(rw.sd_ivp),
   i_0 = ivp(rw.sd_ivp),
   r_0 = ivp(rw.sd_ivp),
+  # sigmaSE = rw.sd_rp,
   a_cov = rw.sd_rp,
   b_cov = rw.sd_rp,
   eps_A = rw.sd_rp,
   f_ai = rw.sd_rp,
   mu_rs = rw.sd_rp,
   tau = rw.sd_rp,
-  rho = rw.sd_rp,
-  sigmaSE = rw.sd_rp
+  rho = rw.sd_rp
 )
 ```
 
@@ -1948,7 +1931,7 @@ pairs(
     +mu_rs
     +tau
     +rho
-    +sigmaSE
+    # +sigmaSE
   ),
   data=subset(model_params_2, log_lik > max(log_lik) - 500)
 )
@@ -1959,7 +1942,7 @@ pairs(
 ### Search box
 
 ```{r}
-sigmaSE_guesses <- runif(Nreps_global, min = 0.003, max = 0.2)
+# sigmaSE_guesses <- runif(Nreps_global, min = 0.003, max = 0.2)
 s_0_guesses <- runif(Nreps_global, min = 0.01, max = 0.99)
 e_0_guesses <- runif(Nreps_global, min = 0.01, max = 0.99)
 a_0_guesses <- runif(Nreps_global, min = 0.01, max = 0.99)
@@ -1974,7 +1957,7 @@ rho_guesses <- runif(Nreps_global, min = 0.01, max = 0.99)
 tau_guesses <- runif(Nreps_global, min = 1e-4, max = 5)
 
 global_guesses_2 <- as.data.frame(cbind(
-  sigmaSE = sigmaSE_guesses,
+  # sigmaSE = sigmaSE_guesses,
   s_0 = s_0_guesses,
   e_0 = e_0_guesses,
   a_0 = a_0_guesses,
@@ -2073,6 +2056,10 @@ model_params_2 <- read.table(
 #### Summary
 
 ```{r}
+coef(m_global_2[[which.max(loglik_global_all_2[,1])]])
+```
+
+```{r}
 summary(model_params_2$log_lik, digits=5)
 ```
 
@@ -2101,7 +2088,7 @@ pairs(
     +mu_rs
     +tau
     +rho
-    +sigmaSE
+    # +sigmaSE
   ),
   data=res_to_plot,
   col=ifelse(res_to_plot$type == "guess", grey(0.5), "red")
@@ -2246,7 +2233,7 @@ rprior_2 <- Csnippet("
   mu_rs = rgamma(mu_rs_0, mu_rs_1);
   tau = rgamma(tau_0, tau_1);
   rho = rbeta(rho_0, rho_1);
-  sigmaSE = rgamma(sigmaSE_0, sigmaSE_1);
+  //sigmaSE = rgamma(sigmaSE_0, sigmaSE_1);
 ")
 
 dprior_2 <- Csnippet("
@@ -2263,7 +2250,7 @@ dprior_2 <- Csnippet("
     + dgamma(mu_rs, mu_rs_0, mu_rs_1, give_log)
     + dgamma(tau, tau_0, tau_1, give_log)
     + dbeta(rho, rho_0, rho_1, give_log)
-    + dgamma(sigmaSE, sigmaSE_0, sigmaSE_1, give_log)
+    //+ dgamma(sigmaSE, sigmaSE_0, sigmaSE_1, give_log)
   );
   if (!give_log) lik = exp(lik);
 ")
@@ -2285,8 +2272,8 @@ plot(test_x, test_y)
 
 ```{r}
 prior_params_2 <- c(
-  sigmaSE_0 = 0.1,
-  sigmaSE_1 = 1,
+  # sigmaSE_0 = 0.1,
+  # sigmaSE_1 = 1,
   a_cov_0 = 3,
   a_cov_1 = 200,
   b_cov_0 = 3,
@@ -6735,7 +6722,6 @@ pairs(
 
 #### Simulations from best model
 
-
 ```{r}
 sims_global_best_ll_6 <- (
   m_global_6[[which(rank(-loglik_global_all_6[,1]) == 1)]]
@@ -9826,7 +9812,6 @@ pairs(
 )
 ```
 
-
 # With Separate Recovered, no hospitalized
 
 ```{r}
@@ -11511,7 +11496,6 @@ pairs(
 ```
 
 #### Simulations from best model
-
 
 ```{r}
 sims_global_best_ll_10 <- (
