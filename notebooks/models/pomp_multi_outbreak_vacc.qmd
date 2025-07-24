@@ -37,7 +37,7 @@ src_dir <- root("src")
 
 # Local Packages
 utils <- new.env()
-source(file.path(src_dir, "model_builder.R"), local=utils)
+source(file.path(src_dir, "modelling.R"), local=utils)
 ```
 
 # Functions
@@ -229,12 +229,6 @@ df_covar <- (
     vacc_prop
   )
 )
-```
-
-```{r}
-cat(utils$model_builder(
-  data = df_full
-))
 ```
 
 # With Covariate Modulation + IDPS + Hospitalized + Vaccinations

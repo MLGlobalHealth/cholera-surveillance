@@ -19,7 +19,12 @@
 build_pomp_model <- function(
     data,
     use_confirmed = FALSE,
+    use_noise = TRUE,
+    use_splines = FALSE,
     use_cov = FALSE,
+    shift_cov = FALSE,
+    n_shift_cov = 0,
+    use_cov_intercept = TRUE,
     use_cov_regression = FALSE,
     scale_infectious = FALSE,
     scale_hospitalized = FALSE,
@@ -27,25 +32,11 @@ build_pomp_model <- function(
     add_hospitalized = FALSE,
     add_idps = FALSE,
     add_disasters = FALSE,
-    add_vaccination = FALSE
+    add_vaccination = FALSE,
+    add_covid = FALSE
 ) {
   
   data_cols <- names(data)
-  
-  # Data to model
-  if (use_confirmed) {
-    y = c("rdt_confirmed")
-  } else {
-    y = c("reports")
-  }
-  df_model <- (
-    data
-    %>% select(
-      date, 
-      y = y
-    )
-    %>% filter(date >= 0)
-  )
   
   # Create covariate table
   covar_names = c("birthrate", "deathrate")
@@ -57,6 +48,9 @@ build_pomp_model <- function(
       covar_names <- c(covar_names, "cov")
     }
   }
+  if (use_splines) {
+    covar_names <- c(covar_names, paste0("seas", seq(1, 6, 1)))
+  }
   if (add_idps) {
     covar_names <- c(covar_names, "idps")
   }
@@ -64,25 +58,93 @@ build_pomp_model <- function(
     covar_names <- c(covar_names, "dis")
   }
   if (add_vaccination) {
-    covar_names <- c(covar_names, "vacc_1_prop", "vacc_2_prop")
+    covar_names <- c(covar_names, "vacc")
+  }
+  if (add_covid) {
+    covar_names <- c(covar_names, "covid")
   }
   
-  df_covar <- data %>% select(date, all_of(covar_names))
+  # Covariate table
+  
+  if (use_splines) {
+    splines <- periodic_bspline_basis(
+      x = data$date, 
+      nbasis = 6, 
+      degree = 6, 
+      period = 1, 
+      names = "seas%d"
+    )
+    data <- (
+      data
+      %>% bind_cols(splines)
+    )
+  }
+  
+  if (shift_cov) {
+    data <- (
+      data
+      %>% mutate(
+        cov = lead(cov, n = n_shift_cov, default = NA),
+      )
+    )
+  }
+  
+  df_covar <- (
+    data 
+    %>% select(date, all_of(covar_names))
+  )
+  
+  if (shift_cov) {
+    df_covar <- (
+      df_covar
+      %>% slice_head(n = (dim(df_covar)[1] - 10))
+    )
+  }
+
+  
   covar <- covariate_table(
     df_covar,
     times = "date"
   )
   
+  # Data to model
+  if (use_confirmed) {
+    y = "rdt_confirmed"
+  } else {
+    y = "reports"
+  }
+  df_model <- (
+    data
+    %>% select(
+      date, 
+      y = all_of(y)
+    )
+    %>% filter(date >= 0)
+  )
+  
+  if (shift_cov) {
+    df_model <- (
+      df_model
+      %>% slice_head(n = (dim(df_model)[1] - 10))
+    )
+  }
+  
   # Observations
   obs_names <- c("y")
   
   # Accumulation variables
-  accum_vars <- c("C", "W")
+  accum_vars <- c("C")
+  if (use_noise) {
+    accum_vars <- c(accum_vars, "W")
+  }
   
   # States
-  states_names <- c("S", "E", "A", "I", "C", "W", "N")
+  states_names <- c("S", "E", "A", "I", "C", "N")
   ivp_names <- c("S", "E", "A", "I")
   ivp_values <- c("s_0", "e_0", "a_0", "i_0")
+  if (use_noise) {
+    states_names <- c(states_names, "W")
+  }
   if (add_hospitalized) {
     states_names <- c(states_names, "H")
     ivp_names <- c(ivp_names, "H")
@@ -98,13 +160,12 @@ build_pomp_model <- function(
     ivp_values <- c(ivp_values, "r_0")
   }
   if (add_vaccination) {
-    states_names <- c(states_names, "V1", "V2")
+    states_names <- c(states_names, "VE", "V")
   }
   
   # Transformation groups
   
   rp_log_names <- c(
-    "sigmaSE",
     "tau"
   )
   rp_logit_names <- c(
@@ -113,8 +174,16 @@ build_pomp_model <- function(
     "rho"
   )
   
+  if (use_noise) {
+    rp_log_names <- c(rp_log_names, "sigmaSE")
+  }
+  if (use_splines) {
+    rp_log_names <- c(rp_log_names, paste0("b_seas_", seq(1, 6, 1)))
+  }
   if (use_cov) {
-    rp_log_names <- c(rp_log_names, "a_cov")
+    if (use_cov_intercept) {
+      rp_log_names <- c(rp_log_names, "a_cov")
+    }
     if (use_cov_regression) {
       for (i in 1:length(cov_reg_names)) {
         rp_log_names <- c(rp_log_names, paste0("b_cov_", i))
@@ -125,7 +194,9 @@ build_pomp_model <- function(
   } else {
     rp_log_names <- c(rp_log_names, "Beta")
   }
-  
+  if (scale_infectious) {
+    rp_logit_names <- c(rp_logit_names, "alpha")
+  }
   if (add_hospitalized) {
     rp_logit_names <- c(rp_logit_names, "f_h")
   }
@@ -136,8 +207,11 @@ build_pomp_model <- function(
     rp_log_names <- c(rp_log_names, "b_dis")
   }
   if (add_vaccination) {
-    rp_log_names <- c(rp_log_names, "mu_vs1", "mu_vs2")
-    rp_logit_names <- c(rp_logit_names, "f_v1", "f_v2")
+    rp_log_names <- c(rp_log_names, "mu_vev", "mu_vs")
+    rp_logit_names <- c(rp_logit_names, "f_v", "vacc_prop")
+  }
+  if (add_covid) {
+    rp_logit_names <- c(rp_logit_names, "b_covid")
   }
   if (use_separate_recovery) {
     rp_log_names <- c(rp_log_names, "mu_ras", "mu_ris")
@@ -146,7 +220,7 @@ build_pomp_model <- function(
   }
   
   # Fixed parameters 
-  N_0 <- 243763
+  N_0 <- 273175  # 2020 population 
   mu_latend <- 1 / ((5/7) / 52) # inverse of latent period (5 days transformed in weeks)
   mu_ar <- 1 / ((10/7) / 52) # inverse of asymptomatic period (10 days transformed in weeks)
   mu_ir <- 1 / ((10/7) / 52)  # inverse of infectious period (10 days transformed in weeks)
@@ -168,12 +242,17 @@ build_pomp_model <- function(
     barycentric = ivp_values
   )
   
-  param_names <- c(rp_log_names, rp_logit_names, ivp_values, names(fixed_params))
+  param_names <- c(
+    rp_log_names, 
+    rp_logit_names, 
+    ivp_values, 
+    names(fixed_params)
+  )
   
   ##################################
   # Model functions
   
-  # Build observation functions
+  # Build measurement functions
   dmeas <- Csnippet("
     double f;
     if (tau > 0.0) {
@@ -200,8 +279,9 @@ build_pomp_model <- function(
     scaling_factor,
     paste(paste0(ivp_names, " = nearbyint(m*", ivp_values, ");"), collapse = "\n"),
     "\n",
-    if (add_vaccination) "V1 = 0;\nV2 = 0;\n",
-    "C = 0;\nW = 0;\n",
+    if (add_vaccination) "VE = 0;\nV = 0;\n",
+    "C = 0;\n",
+    if (use_noise) "W = 0;\n",
     paste0("N = ", paste(ivp_names, collapse = "+"), ";")
   )
   rinit <- Csnippet(rinit_str)
@@ -217,11 +297,14 @@ build_pomp_model <- function(
     num_rates <- num_rates + 2
   }
   if (add_vaccination) {
-    num_rates <- num_rates + 6
+    num_rates <- num_rates + 8
   }
   
   num_idps_rates <- 4
   if (add_hospitalized) {
+    num_idps_rates <- num_idps_rates + 1
+  }
+  if (use_separate_recovery) {
     num_idps_rates <- num_idps_rates + 1
   }
   if (add_vaccination) {
@@ -234,7 +317,8 @@ build_pomp_model <- function(
   noise <- "dw = rgammawn(sigmaSE, dt);\n\n"
   
   variable_definitions <- paste0(
-    "double foi, births, dw;\n",
+    "double foi, births;\n",
+    if (use_noise) "double dw;\n",
     if (add_hospitalized) "double hosp;\n",
     paste0("double rate[", num_rates, "];\n"),
     paste0("double trans[", num_rates, "];\n"),
@@ -244,22 +328,13 @@ build_pomp_model <- function(
         paste0("double rate_idps[", num_idps_rates, "];\n"),
         paste0("int trans_idps[", num_idps_rates, "];\n")
       )
-    },
-    if (add_vaccination) {
-      if (use_separate_recovery) {
-        "int SV1, RAV1, RIV1, AV1, V1V2;\n\n"
-      } else {
-        "int SV1, RV1, AV1, V1V2;\n\n"
-      }
-    },
-    "\n"
+    }
   )
   
   ## IDPS
   
   if (add_hospitalized) {
     ref_comp <- "H"
-    
   } else {
     ref_comp <- "I"
   }
@@ -269,7 +344,7 @@ build_pomp_model <- function(
   out_comp <- states_names[!(states_names %in% c(ref_comp, no_trans_comp))]
   vacc_comp <- states_names[startsWith(states_names, "V")]
   in_comp <- states_names[!(states_names %in% c(ref_comp, no_trans_comp, vacc_comp))]
-  idps <- paste0(
+  idps_proc <- paste0(
     "if (idps < 0) {\n",
     paste0("  if (N > ", ref_comp, ") {\n"),
     paste0("    idps_scaled = floor(fmin((-idps * b_idps), ", ref_pop, "));\n"),
@@ -286,86 +361,58 @@ build_pomp_model <- function(
     paste0("\nN = ", paste(trans_comp, collapse = "+"), ";\n\n")
   )
   
-  ## Vaccination
-  
-  if (use_separate_recovery) {
-    vacc <- paste0(
-      "if (vacc_1_prop > 0) {\n",
-      "  SV1 = rbinom(S, vacc_1_prop);\n",
-      "  RAV1 = rbinom(RA, vacc_1_prop);\n",
-      "  RIV1 = rbinom(RI, vacc_1_prop);\n",
-      "  AV1 = rbinom(A, vacc_1_prop);\n",
-      "  S -= SV1;\n",
-      "  RA -= RAV1;\n",
-      "  RI -= RIV1;\n",
-      "  A -= AV1;\n",
-      "  V1 += SV1 + RAV1 + RIV1 + AV1;\n",
-      "}\n",
-      "if (vacc_2_prop > 0) {\n",
-      "  SV1 = rbinom(S, vacc_2_prop);\n",
-      "  RAV1 = rbinom(RA, vacc_2_prop);\n",
-      "  RIV1 = rbinom(RI, vacc_2_prop);\n",
-      "  AV1 = rbinom(A, vacc_2_prop);\n",
-      "  V1V2 = rbinom(V1, vacc_2_prop);\n",
-      "  S -= SV1;\n",
-      "  RA -= RAV1;\n",
-      "  RI -= RIV1;\n",
-      "  A -= AV1;\n",
-      "  V1 += SV1 + RV1 + AV1 - V1V2;\n",
-      "  V2 += V1V2;\n",
-      "}\n"
-    )
-  } else {
-    vacc <- paste0(
-      "if (vacc_1_prop > 0) {\n",
-      "  SV1 = rbinom(S, vacc_1_prop);\n",
-      "  RV1 = rbinom(R, vacc_1_prop);\n",
-      "  AV1 = rbinom(A, vacc_1_prop);\n",
-      "  S -= SV1;\n",
-      "  R -= RV1;\n",
-      "  A -= AV1;\n",
-      "  V1 += SV1 + RV1 + AV1;\n",
-      "}\n",
-      "if (vacc_2_prop > 0) {\n",
-      "  SV1 = rbinom(S, vacc_2_prop);\n",
-      "  RV1 = rbinom(R, vacc_2_prop);\n",
-      "  AV1 = rbinom(A, vacc_2_prop);\n",
-      "  V1V2 = rbinom(V1, vacc_2_prop);\n",
-      "  S -= SV1;\n",
-      "  R -= RV1;\n",
-      "  A -= AV1;\n",
-      "  V1 += SV1 + RV1 + AV1 - V1V2;\n",
-      "  V2 += V1V2;\n",
-      "}\n\n"
-    )
-  }
-  
   ## Force of infection
   if (use_cov) {
+    if (use_cov_intercept) {
+      Beta <- "(a_cov + "
+    } else {
+      Beta <- "("
+    }
+    # else {
+    #   Beta <- "(1 + "
+    # }
     if (use_cov_regression) {
       Beta <- paste0(
-        "(a_cov + ",
+        Beta,
         paste0("b_cov_", seq(1, length(cov_reg_names), 1), " * ", cov_reg_names, collapse = " + ")
       )
     } else {
-      Beta <- "(a_cov + b_cov * cov"
+      Beta <- paste0(
+        Beta,
+        "b_cov * cov"
+      )
     }
     if (add_disasters) {
-      Beta <- paste0(Beta, " + b_dis * dis)")
-    } else {
-      Beta <- paste0(Beta, ")")
+      Beta <- paste0(Beta, " + b_dis * dis")
     }
   } else {
-    Beta <- "Beta"
+    Beta <- "(Beta"
   }
+  
+  if (use_splines) {
+    Beta <- paste0(
+      Beta,
+      " + ",
+      paste0("b_seas_", seq(1, 6, 1), " * seas", seq(1, 6, 1), collapse = " + ")
+    )
+  }
+  
+  Beta <- paste0(Beta, ")")
+  
+  if (add_covid) {
+    Beta <- paste0(Beta, " * (1 - b_covid * covid)")
+    # Beta <- paste0(Beta, " * (1 - 0.5 * covid)")
+  }
+  
   inf <- "(I + eps_A * A)"
   if (scale_infectious) { 
     inf <- paste0("pow(", inf, ", alpha)")
   }
   foi <- paste0(
     "foi = ",
+    if(use_noise) "dw/dt * ",
     Beta,
-    "*",
+    " * ",
     inf,
     "/N;\n\n"
   )
@@ -381,7 +428,8 @@ build_pomp_model <- function(
   ## Transition rates
   
   rates <- c(
-    "foi * dw/dt",
+    "foi",
+    if (add_vaccination) "vacc * vacc_prop",
     "deathrate",
     "mu_latend * f_ai"
   )
@@ -430,11 +478,11 @@ build_pomp_model <- function(
   if (add_vaccination) {
     rates <- c(
       rates,
-      "f_v1 * foi",
-      "mu_vs1",
+      "foi",
+      "mu_vev",
       "deathrate",
-      "f_v2 * foi",
-      "mu_vs2",
+      "f_v * foi",
+      "mu_vs",
       "deathrate"
     )
   }
@@ -455,6 +503,7 @@ build_pomp_model <- function(
   }
   if (add_vaccination) {
     trans_num <- c(trans_num, 3, 3)
+    trans_num[1] <- trans_num[1] + 1
   }
   trans_starts <- cumsum(c(0, trans_num[1:length(trans_num) - 1]))
   trans_ends <- cumsum(trans_num)
@@ -502,9 +551,10 @@ build_pomp_model <- function(
     "\n\n"
   )
   
-  ### in_updatess
+  ### in_updates
   
   rec_names <- trans_comp[which(startsWith(trans_comp, "R"))]
+  susc_idxs <- which(startsWith(trans_comp, "S"))
   rec_idxs <- which(startsWith(trans_comp, "R"))
   exp_idxs <- which(startsWith(trans_comp, "E"))
   asymp_idxs <- which(startsWith(trans_comp, "A"))
@@ -515,11 +565,33 @@ build_pomp_model <- function(
   if (add_vaccination) {
     in_updates_s_idxs <- c(
       trans_starts[rec_idxs],
-      trans_starts[vacc_idxs[[1]]] + 1
+      trans_starts[vacc_idxs[[2]]] + 1
+    )
+    in_updates_e_idxs <- c(
+      0,
+      trans_starts[vacc_idxs[1]]
+    )
+    in_updates_a_idxs <- c(
+      trans_starts[exp_idxs],
+      trans_starts[vacc_idxs[2]]
+    )
+    in_updates_ve <- paste0(
+      "VE += trans[1];\n"
+    )
+    in_updates_v <- paste0(
+      "V += trans[",
+      trans_starts[vacc_idxs[[1]]] + 1,
+      "];\n"
     )
   } else {
     in_updates_s_idxs <- c(
       trans_starts[rec_idxs]
+    )
+    in_updates_e_idxs <- c(
+      0
+    )
+    in_updates_a_idxs <- c(
+      trans_starts[exp_idxs]
     )
   }
   in_updates_s <- paste0(
@@ -532,17 +604,16 @@ build_pomp_model <- function(
     ),
     ";\n"
   )
-  in_updates_e <- "E += trans[0];\n"
-  if (add_vaccination) {
-    in_updates_a_idxs <- c(
-      trans_starts[exp_idxs],
-      trans_starts[vacc_idxs]
-    )
-  } else {
-    in_updates_a_idxs <- c(
-      trans_starts[exp_idxs]
-    )
-  }
+  in_updates_e <- paste0(
+    "E += ",
+    paste0(
+      "trans[",
+      in_updates_e_idxs,
+      "]",
+      collapse = "+"
+    ),
+    ";\n"
+  )
   in_updates_a <- paste0(
     "A += ",
     paste0(
@@ -610,17 +681,15 @@ build_pomp_model <- function(
     )
   }
   
-  
-  in_updates_v <- paste0("V1 += trans[", trans_starts[vacc_idxs[2]] + 1, "];\n")
-  
   in_updates <- paste0(
     in_updates_s,
     in_updates_e,
     in_updates_a,
     in_updates_i,
     if (add_hospitalized) in_updates_h,
-    in_updates_r,
+    if (add_vaccination) in_updates_ve,
     if (add_vaccination) in_updates_v,
+    in_updates_r,
     "\n"
   )
   
@@ -640,10 +709,9 @@ build_pomp_model <- function(
   
   rprocess_str <- paste0(
     variable_definitions,
-    if (add_idps) idps,
-    if (add_vaccination) vacc,
+    if (add_idps) idps_proc,
     births,
-    noise,
+    if (use_noise) noise,
     foi,
     if (add_hospitalized) hosp,
     rates,
@@ -652,7 +720,7 @@ build_pomp_model <- function(
     in_updates,
     meas_state,
     "\n",
-    "W += (dw - dt)/sigmaSE;\n\n",
+    if (use_noise) "W += (dw - dt)/sigmaSE;\n\n",
     paste0("N = ", paste(trans_comp, collapse = "+"), ";\n")
   )
   
@@ -682,103 +750,11 @@ build_pomp_model <- function(
       params = fixed_params
     )
   )
-
+  
+  # cat(trans_comp, trans_starts, susc_idxs)
+  # cat(rprocess_str)
+  # cat(rinit_str)
   m
-  # rprocess_str
 }
 
-
-#' Run global search on a pomp object
-#' 
-#' Starting points are passed to the function together with the search parameters.
-#' @import dplyr, pomp
-#' @return A pomp object
-#' 
-
-run_global_search <- function(
-    model,
-    guess_points,
-    rw.sd,
-    Np,
-    Nmif,
-    Nreps,
-    Nreps_eval,
-    out_filename,
-    reset_data = FALSE
-) {
-  start <- Sys.time()
-  model_params <- coef(model)
-  fixed_params <- model_params[!(names(model_params) %in% names(guess_points))]
-  
-  m_global <- foreach (guess=iter(guess_points, "row"), .combine=c) %dopar% {
-    (
-      model
-      %>% mif2(
-        Np=Np,
-        Nmif=Nmif, 
-        params=c(fixed_params, unlist(guess)),
-        cooling.fraction.50 = 0.5,
-        rw.sd = rw.sd
-      )
-      %>% mif2(cooling.fraction.50 = 0.1)
-    )
-  }
-  
-  loglik_global <- (
-    foreach(
-      i=1:Nreps,
-      .combine=rbind
-    ) %dopar% {
-      logmeanexp(
-        replicate(
-          Nreps_eval,
-          logLik(pfilter(model, params=coef(m_global[[i]]), Np=1000))
-        ),
-        se=TRUE
-      )
-    }
-  )
-  
-  df_results <- (
-    data.frame(
-      t(sapply(m_global, coef)),
-      log_lik=loglik_global[,1],
-      log_lik_se=loglik_global[,2]
-    )
-  )
-  
-  end <- Sys.time()
-  
-  
-  if (reset_data) {
-    write.table(
-      df_results, 
-      file = out_filename, 
-      append = FALSE,
-      col.names = TRUE,
-      row.names = FALSE
-    )
-  } else {
-    append <- FALSE
-    col.names <- TRUE
-    row.names <- FALSE
-    if (file.exists(out_filename)) {
-      append <- TRUE
-      col.names <- FALSE
-    }
-    (
-      write.table(
-        df_results, 
-        file = out_filename, 
-        append = append,
-        col.names = col.names,
-        row.names = row.names
-      )
-    )
-  }
-  
-  cat("Run time of global iterated particle filter: ", as.integer(round(difftime(end, start, units='mins'))), " minutes")
-  
-  df_results
-  
-}
+    
