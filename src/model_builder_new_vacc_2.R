@@ -207,8 +207,10 @@ build_pomp_model <- function(
     rp_log_names <- c(rp_log_names, "b_dis")
   }
   if (add_vaccination) {
-    rp_log_names <- c(rp_log_names, "mu_vev", "mu_vs")
-    rp_logit_names <- c(rp_logit_names, "f_v", "vacc_prop")
+    rp_log_names <- c(rp_log_names, "mu_vacc", "mu_vev", "mu_vs")
+    rp_logit_names <- c(rp_logit_names, "f_v")
+    # rp_log_names <- c(rp_log_names, "mu_vev", "mu_vs")
+    # rp_logit_names <- c(rp_logit_names, "f_v", "mu_vacc")
   }
   if (add_covid) {
     rp_logit_names <- c(rp_logit_names, "b_covid")
@@ -297,7 +299,7 @@ build_pomp_model <- function(
     num_rates <- num_rates + 2
   }
   if (add_vaccination) {
-    num_rates <- num_rates + 8
+    num_rates <- num_rates + 7
   }
   
   num_idps_rates <- 4
@@ -429,7 +431,7 @@ build_pomp_model <- function(
   
   rates <- c(
     "foi",
-    if (add_vaccination) "vacc * vacc_prop",
+    if (add_vaccination) "vacc * mu_vacc",
     "deathrate",
     "mu_latend * f_ai"
   )
@@ -569,11 +571,12 @@ build_pomp_model <- function(
     )
     in_updates_e_idxs <- c(
       0,
-      trans_starts[vacc_idxs[1]]
-    )
-    in_updates_a_idxs <- c(
-      trans_starts[exp_idxs],
+      trans_starts[vacc_idxs[1]],
       trans_starts[vacc_idxs[2]]
+    )
+    in_updates_i_idxs <- c(
+      trans_starts[exp_idxs] + 1
+      # trans_starts[vacc_idxs[2]]
     )
     in_updates_ve <- paste0(
       "VE += trans[1];\n"
@@ -590,8 +593,8 @@ build_pomp_model <- function(
     in_updates_e_idxs <- c(
       0
     )
-    in_updates_a_idxs <- c(
-      trans_starts[exp_idxs]
+    in_updates_i_idxs <- c(
+      trans_starts[exp_idxs] + 1
     )
   }
   in_updates_s <- paste0(
@@ -615,19 +618,19 @@ build_pomp_model <- function(
     ";\n"
   )
   in_updates_a <- paste0(
-    "A += ",
+    "A += trans[",
+    trans_starts[exp_idxs],
+    "];\n"
+  )
+  in_updates_i <- paste0(
+    "I += ",
     paste0(
       "trans[",
-      in_updates_a_idxs,
+      in_updates_i_idxs,
       "]",
       collapse = "+"
     ),
     ";\n"
-  )
-  in_updates_i <- paste0(
-    "I += trans[",
-    trans_starts[exp_idxs] + 1,
-    "];\n"
   )
   
   if (add_hospitalized) {

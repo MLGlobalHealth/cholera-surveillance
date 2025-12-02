@@ -124,7 +124,7 @@ plot_data_and_summary_sims <- function(data, target, sims) {
     )
     + geom_ribbon(
       data = sims,
-      aes(x = date, ymin = q05, ymax = q95, fill = "band"),
+      aes(x = date, ymin = q07, ymax = q93, fill = "band"),
       alpha=0.3
     )
     + scale_color_manual(
@@ -135,7 +135,7 @@ plot_data_and_summary_sims <- function(data, target, sims) {
     + scale_fill_manual(
       name = "",
       values = c("band" = "cornflowerblue"),
-      labels = c("band" = "95% coverage")
+      labels = c("band" = "86% coverage")
     )
     + scale_x_date(
       breaks = c(as.Date(paste0(years, "-01-01")), as.Date(paste0(years, "-07-01"))),
@@ -147,21 +147,43 @@ plot_data_and_summary_sims <- function(data, target, sims) {
     )
     + labs(
       x = "Date",
-      y = "Counts"
+      y = "Cases"
     )
   )
 }
 
 plot_compartments_sims <- function(data, sims, compartments, n = 20) {
+  compartment_map <- c(
+    "Population" = "N",
+    "Susceptible" = "S",
+    "Exposed" = "E",
+    "Asymptomatic" = "A",
+    "Symptomatic" = "I",
+    "Hospitalized" = "H",
+    "Recovered Asymptomatic" = "RA",
+    "Recovered Infectious" = "RI",
+    "Vaccinated" = "VE",
+    "Vaccinated Immune" = "V",
+    "Cases" = "C"
+  )
   sims <- (
     sims
-    %>% filter(.id %in% sample.int(sims$.id %>% unique() %>% length(), n))
     %>% select(date, .id, all_of(compartments))
+    %>% rename(all_of(compartment_map[compartment_map %in% compartments]))
     %>% pivot_longer(
       cols = -c(date, .id),
       names_to = "compartment",
       values_to = "counts"
     )
+    %>% group_by(date, compartment)
+    %>% summarise(
+      q07 = quantile(counts, 0.07, na.rm = TRUE),
+      q50 = quantile(counts, 0.5, na.rm = TRUE),
+      mean = mean(counts, na.rm = TRUE),
+      q93 = quantile(counts, 0.93, na.rm = TRUE),
+      .groups = "drop"
+    )
+    %>% ungroup()
   )
   min_year <- min(year(data$date))
   max_year <- max(year(data$date))
@@ -184,26 +206,44 @@ plot_compartments_sims <- function(data, sims, compartments, n = 20) {
       legend.margin = margin(0, 0, 0, 0),
       legend.spacing.y = unit(-15, "pt"),
       legend.position = "inside",
-      legend.position.inside = c(0.75, 0.88),
+      legend.position.inside = c(0.4, 0.93),
       strip.background = element_blank(),
       strip.text = element_text(size = 12, face = "bold")
     )
     + geom_line(
       data = sims,
-      aes(x = date, y = counts, color = .id),
-      linewidth = 0.5,
-      alpha = 0.5
+      mapping = aes(x = date, y = q50, color = "median"), 
+      linetype = "solid",
+      linewidth = 1
+    )
+    + geom_ribbon(
+      data = sims,
+      aes(x = date, ymin = q07, ymax = q93, fill = "band"),
+      alpha=0.3
+    )
+    + scale_color_manual(
+      name = "",
+      values = c("median" = "forestgreen"),
+      labels = c("median" = "Median of simulated trajectories")
+    )
+    + scale_fill_manual(
+      name = "",
+      values = c("band" = "forestgreen"),
+      labels = c("band" = "86% coverage")
     )
     + facet_wrap(
       ~compartment, 
       scales = "free_y", 
-      ncol = 3
+      ncol = 1
     )
     + scale_x_date(
       breaks = c(as.Date(paste0(years, "-01-01")), as.Date(paste0(years, "-07-01"))),
       labels = c(rep(c(""), num_years), rep(years)),
     )
-    + guides(color = "none")
+    + guides(
+      color = guide_legend(order = 1),
+      fill = guide_legend(order = 2)
+    )
     + labs(
       x = "Date",
       y = "Counts"

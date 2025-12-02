@@ -130,7 +130,8 @@ df_reports <- (
     # file.path(proc_data_dir, "uvira_chol_cov_week_20250501.csv", fsep = "/"),
     # file.path(proc_data_dir, "uvira_chol_cov_week_20250505.csv", fsep = "/"),
     # file.path(proc_data_dir, "uvira_chol_cov_week_20250512.csv", fsep = "/"),
-    file.path(proc_data_dir, "uvira_chol_cov_week_20250711.csv", fsep = "/"),
+    # file.path(proc_data_dir, "uvira_chol_cov_week_20250711.csv", fsep = "/"),
+    file.path(proc_data_dir, "uvira_chol_cov_week_20250725.csv", fsep = "/"),
     show_col_types = FALSE
   )
   %>% mutate(
@@ -277,7 +278,6 @@ ggsave(
   units = "in"
 )
 ```
-
 
 ```{r}
 #| fig-width: 6
@@ -473,8 +473,8 @@ Maybe the RDT confirmed are zero inflated?
 reset_data <- TRUE
 run_level <- 2
 Np <- switch(run_level, 100, 1e3, 5e3)
-Nmif <- switch(run_level, 20, 100, 200)
-Nreps <- switch(run_level, 10, 20, 100)
+Nmif <- switch(run_level, 20, 200, 400)
+Nreps <- switch(run_level, 10, 40, 100)
 Nreps_eval <- switch(run_level, 2, 10, 20)
 Nsim <- switch(run_level, 50, 100, 500)
 profile_pts <- switch(run_level, 3, 5, 30)
@@ -537,7 +537,7 @@ df_full <- (
 )
 ```
 
-# Baseline Model
+# 1. Baseline Model
 
 ```{r}
 output_model_name_1 <- "uvira_multioutbreak_no_dis_no_int_1.rda"
@@ -762,7 +762,7 @@ ggsave(
 )
 ```
 
-# With Covariate Modulation
+# 2. With Covariate Modulation
 
 ```{r}
 output_model_name_2 <- "uvira_multioutbreak_no_dis_no_int_2.rda"
@@ -895,6 +895,27 @@ df_results_2 <- global_searches$collect_and_save_loglik(
 
 ### Diagnostic
 
+#### Convergence
+
+```{r}
+(
+  m_global_2
+  %>% traces()
+  %>% melt()
+  %>% ggplot(
+    aes(
+      x=iteration,
+      y=value,
+      group=.L1,
+      color=factor(.L1)
+    )
+  )
+  + geom_line()
+  + guides(color="none")
+  + facet_wrap(~name, scales="free_y")
+)
+```
+
 #### Summary
 
 ```{r}
@@ -910,7 +931,7 @@ summary(df_results_2$log_lik, digits=5)
 ```{r}
 #| fig-width: 10
 #| fig-asp: 1
-viz$plot_pairs(guess_points_2, df_results_2)
+viz$plot_pairs(guess_points_2, df_results_2, log_lik_diff = 3)
 dev.print(
   device = png, 
   filename = file.path(img_dir, "pair_plot_no_int_2.png"),
@@ -958,10 +979,18 @@ ggsave(
 #| fig-width: 7
 #| fig-height: 3
 sims_best_stats_2 <- global_searches$calculate_sim_stats(sims_best_2)
-viz$plot_data_and_summary_sims(
-  df_reports,
-  target = "reports",
-  sims = sims_best_stats_2
+(
+  viz$plot_data_and_summary_sims(
+    df_reports,
+    target = "reports",
+    sims = sims_best_stats_2
+  )
+  + labs(title = "No interventions")
+  + scale_y_continuous(limits = c(0, 170))
+  + guides(
+    color = "none",
+    fill = "none"
+  )
 )
 ggsave(
   filename = file.path(img_dir, "agg_sim_no_int_2.png"),
@@ -971,8 +1000,7 @@ ggsave(
 )
 ```
 
-
-# With Covariate Modulation + IDPS
+# 3. With Covariate Modulation + IDPS
 
 ```{r}
 output_model_name_3 <- "uvira_multioutbreak_no_dis_no_int_3.rda"
@@ -1180,7 +1208,7 @@ ggsave(
 )
 ```
 
-# With Covariate Modulation + IDPS + Hospitalized
+# 4. With Covariate Modulation + IDPS + Hospitalized
 
 ```{r}
 output_model_name_4 <- "uvira_multioutbreak_no_dis_no_int_4.rda"
@@ -1394,7 +1422,7 @@ ggsave(
 )
 ```
 
-# With IDPS + Separate Recovered + Hospitalized
+# 5. With IDPS + Separate Recovered + Hospitalized
 
 ```{r}
 output_model_name_5 <- "uvira_multioutbreak_no_dis_no_int_5.rda"
@@ -1616,7 +1644,7 @@ ggsave(
 )
 ```
 
-# With IDPS + Separate Recovered + no hospitalized
+# 6. With IDPS + Separate Recovered + no hospitalized
 
 ```{r}
 output_model_name_6 <- "uvira_multioutbreak_no_dis_no_int_6.rda"
@@ -1761,6 +1789,27 @@ df_results_6 <- global_searches$collect_and_save_loglik(
 
 ### Diagnostic
 
+#### Convergence
+
+```{r}
+(
+  m_global_6
+  %>% traces()
+  %>% melt()
+  %>% ggplot(
+    aes(
+      x=iteration,
+      y=value,
+      group=.L1,
+      color=factor(.L1)
+    )
+  )
+  + geom_line()
+  + guides(color="none")
+  + facet_wrap(~name, scales="free_y")
+)
+```
+
 #### Summary
 
 ```{r}
@@ -1791,6 +1840,21 @@ sims_best_6 <- (
   %>% mutate(
     date = df_reports$date[1] + weeks(round(date * 52))
   )
+)
+```
+
+##### Compartments
+
+```{r}
+#| fig-width: 5
+#| fig-height: 3
+
+viz$plot_compartments_sims(df_reports, sims_best_6, c("N"))
+ggsave(
+  filename = file.path(img_dir, "compartments_sim_no_int_6.png"),
+  width = 5,
+  height = 3,
+  units = "in"
 )
 ```
 
@@ -1831,11 +1895,11 @@ ggsave(
 )
 ```
 
-# With IDPS + Separate Recovered + no hospitalized + vaccinations
+# 7. With IDPS + Separate Recovered + no hospitalized + vaccinations
 
 ```{r}
-output_model_name_7 <- "uvira_multioutbreak_no_dis_no_int_7.rda"
-output_params_path_7 <- file.path(output_params_dir, "uvira_multioutbreak_no_dis_no_int_7.csv")
+output_model_name_7 <- "uvira_multioutbreak_no_dis_no_int_vacc_to_sym_7.rda"
+output_params_path_7 <- file.path(output_params_dir, "uvira_multioutbreak_no_dis_no_int_vacc_to_sym_7.csv")
 ```
 
 ## Model Definition
@@ -1871,7 +1935,7 @@ rw.sd_7 <- rw_sd(
   ri_0 = ivp(rw.sd_ivp),
   sigmaSE = rw.sd_rp,
   b_cov = rw.sd_rp,
-  vacc_prop = rw.sd_rp,
+  mu_vacc = rw.sd_rp,
   f_v = rw.sd_rp,
   mu_vev = rw.sd_rp,
   mu_vs = rw.sd_rp,
@@ -1897,7 +1961,7 @@ ri_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
 b_cov_guesses <- runif(Nreps, min = 2, max = 2000)
 eps_A_guesses <- runif(Nreps, min = 0.01, max = 0.5)
 f_ai_guesses <- runif(Nreps, min = 0.1, max = 0.99)
-vacc_prop_guesses <- runif(Nreps, min = 0.01, max = 1)
+mu_vacc_guesses <- runif(Nreps, min = 0.01, max = 1)
 f_v_guesses <- runif(Nreps, min = 0.01, max = 1)
 mu_vev_guesses <- runif(Nreps, min = 1e-3, 200)
 mu_vs_guesses <- runif(Nreps, min = 1e-3, 200)
@@ -1920,7 +1984,7 @@ guess_points_7 <- as.data.frame(cbind(
   b_cov = b_cov_guesses,
   eps_A = eps_A_guesses,
   f_ai = f_ai_guesses,
-  vacc_prop = vacc_prop_guesses,
+  mu_vacc = mu_vacc_guesses,
   f_v = f_v_guesses,
   mu_vev = mu_vev_guesses,
   mu_vs = mu_vs_guesses,
@@ -1989,6 +2053,27 @@ df_results_7 <- global_searches$collect_and_save_loglik(
 
 ### Diagnostic
 
+#### Convergence
+
+```{r}
+(
+  m_global_7
+  %>% traces()
+  %>% melt()
+  %>% ggplot(
+    aes(
+      x=iteration,
+      y=value,
+      group=.L1,
+      color=factor(.L1)
+    )
+  )
+  + geom_line()
+  + guides(color="none")
+  + facet_wrap(~name, scales="free_y")
+)
+```
+
 #### Summary
 
 ```{r}
@@ -2019,6 +2104,21 @@ sims_best_7 <- (
   %>% mutate(
     date = df_reports$date[1] + weeks(round(date * 52))
   )
+)
+```
+
+##### Compartments
+
+```{r}
+#| fig-width: 5
+#| fig-height: 4
+
+viz$plot_compartments_sims(df_reports, sims_best_7, c("N", "V"))
+ggsave(
+  filename = file.path(img_dir, "compartments_sim_no_int_7.png"),
+  width = 5,
+  height = 4,
+  units = "in"
 )
 ```
 
@@ -2059,11 +2159,11 @@ ggsave(
 )
 ```
 
-# With Separate Recovered, hospitalized, vaccinations
+# 8. With Separate Recovered, hospitalized, vaccinations
 
 ```{r}
-output_model_name_8 <- "uvira_multioutbreak_no_dis_no_int_8.rda"
-output_params_path_8 <- file.path(output_params_dir, "uvira_multioutbreak_no_dis_new_data_no_int_8.csv")
+output_model_name_8 <- "uvira_multioutbreak_no_dis_no_int_vacc_to_sym_8.rda"
+output_params_path_8 <- file.path(output_params_dir, "uvira_multioutbreak_no_dis_new_data_no_int_vacc_to_sym_8.csv")
 ```
 
 ## Model Definition
@@ -2104,7 +2204,7 @@ rw.sd_8 <- rw_sd(
   f_ai = rw.sd_rp,
   eps_A = rw.sd_rp,
   f_h = rw.sd_rp,
-  vacc_prop = rw.sd_rp,
+  mu_vacc = rw.sd_rp,
   f_v = rw.sd_rp,
   mu_vev = rw.sd_rp,
   mu_vs = rw.sd_rp,
@@ -2130,7 +2230,7 @@ b_cov_guesses <- runif(Nreps, min = 2, max = 2000)
 eps_A_guesses <- runif(Nreps, min = 0.01, max = 0.5)
 f_h_guesses <- runif(Nreps, min = 0.01, max = 0.99)
 f_ai_guesses <- runif(Nreps, min = 0.1, max = 0.99)
-vacc_prop_guesses <- runif(Nreps, min = 0.01, max = 1)
+mu_vacc_guesses <- runif(Nreps, min = 0.01, max = 1)
 f_v_guesses <- runif(Nreps, min = 0.01, max = 1)
 mu_vev_guesses <- runif(Nreps, min = 1e-3, 200)
 mu_vs_guesses <- runif(Nreps, min = 1e-3, 200)
@@ -2155,7 +2255,7 @@ guess_points_8 <- as.data.frame(cbind(
   eps_A = eps_A_guesses,
   f_h = f_h_guesses,
   f_ai = f_ai_guesses,
-  vacc_prop = vacc_prop_guesses,
+  mu_vacc = mu_vacc_guesses,
   f_v = f_v_guesses,
   mu_vev = mu_vev_guesses,
   mu_vs = mu_vs_guesses,
@@ -2224,6 +2324,27 @@ df_results_8 <- global_searches$collect_and_save_loglik(
 
 ### Diagnostic
 
+#### Convergence
+
+```{r}
+(
+  m_global_8
+  %>% traces()
+  %>% melt()
+  %>% ggplot(
+    aes(
+      x=iteration,
+      y=value,
+      group=.L1,
+      color=factor(.L1)
+    )
+  )
+  + geom_line()
+  + guides(color="none")
+  + facet_wrap(~name, scales="free_y")
+)
+```
+
 #### Summary
 
 ```{r}
@@ -2255,6 +2376,15 @@ sims_best_8 <- (
     date = df_reports$date[1] + weeks(round(date * 52))
   )
 )
+```
+
+##### Compartments
+
+```{r}
+#| fig-width: 5
+#| fig-height: 7
+
+viz$plot_compartments_sims(df_reports, sims_best_8, c("N", "VE", "V"))
 ```
 
 ##### Individual plots
@@ -2296,11 +2426,11 @@ ggsave(
 
 Clearly the model tries to return the vaccinated to the "normal" compartments quickly because the vaccinations are in the middle of periods of high number of cases.
 
-# With Separate Recovered, vaccinations
+# 9. With Separate Recovered, vaccinations
 
 ```{r}
-output_model_name_9 <- "uvira_multioutbreak_no_dis_no_int_9.rda"
-output_params_path_9 <- file.path(output_params_dir, "uvira_multioutbreak_no_dis_no_int_9.csv")
+output_model_name_9 <- "uvira_multioutbreak_no_dis_no_int_vacc_to_sym_9.rda"
+output_params_path_9 <- file.path(output_params_dir, "uvira_multioutbreak_no_dis_no_int_vacc_to_sym_9.csv")
 ```
 
 ## Model Definition
@@ -2337,7 +2467,7 @@ rw.sd_9 <- rw_sd(
   b_cov = rw.sd_rp,
   f_ai = rw.sd_rp,
   eps_A = rw.sd_rp,
-  vacc_prop = rw.sd_rp,
+  mu_vacc = rw.sd_rp,
   f_v = rw.sd_rp,
   mu_vev = rw.sd_rp,
   mu_vs = rw.sd_rp,
@@ -2360,7 +2490,7 @@ ri_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
 b_cov_guesses <- runif(Nreps, min = 2, max = 2000)
 eps_A_guesses <- runif(Nreps, min = 0.01, max = 0.5)
 f_ai_guesses <- runif(Nreps, min = 0.1, max = 0.99)
-vacc_prop_guesses <- runif(Nreps, min = 0.01, max = 1)
+mu_vacc_guesses <- runif(Nreps, min = 0.01, max = 1)
 f_v_guesses <- runif(Nreps, min = 0.01, max = 1)
 mu_vev_guesses <- runif(Nreps, min = 1e-3, 200)
 mu_vs_guesses <- runif(Nreps, min = 1e-3, 200)
@@ -2382,7 +2512,7 @@ guess_points_9 <- as.data.frame(cbind(
   b_cov = b_cov_guesses,
   eps_A = eps_A_guesses,
   f_ai = f_ai_guesses,
-  vacc_prop = vacc_prop_guesses,
+  mu_vacc = mu_vacc_guesses,
   f_v = f_v_guesses,
   mu_vev = mu_vev_guesses,
   mu_vs = mu_vs_guesses,
@@ -2450,6 +2580,27 @@ df_results_9 <- global_searches$collect_and_save_loglik(
 
 ### Diagnostic
 
+#### Convergence
+
+```{r}
+(
+  m_global_9
+  %>% traces()
+  %>% melt()
+  %>% ggplot(
+    aes(
+      x=iteration,
+      y=value,
+      group=.L1,
+      color=factor(.L1)
+    )
+  )
+  + geom_line()
+  + guides(color="none")
+  + facet_wrap(~name, scales="free_y")
+)
+```
+
 #### Summary
 
 ```{r}
@@ -2480,6 +2631,21 @@ sims_best_9 <- (
   %>% mutate(
     date = df_reports$date[1] + weeks(round(date * 52))
   )
+)
+```
+
+##### Compartments
+
+```{r}
+#| fig-width: 5
+#| fig-height: 4
+
+viz$plot_compartments_sims(df_reports, sims_best_9, c("N", "V"))
+ggsave(
+  filename = file.path(img_dir, "compartments_sim_no_int_9.png"),
+  width = 5,
+  height = 4,
+  units = "in"
 )
 ```
 
@@ -2520,11 +2686,11 @@ ggsave(
 )
 ```
 
-# With Separate Recovered, vaccinations, COVID
+# 10. With Separate Recovered, vaccinations, COVID
 
 ```{r}
-output_model_name_10 <- "uvira_multioutbreak_no_dis_no_int_10.rda"
-output_params_path_10 <- file.path(output_params_dir, "uvira_multioutbreak_no_dis_no_int_10.csv")
+output_model_name_10 <- "uvira_multioutbreak_no_dis_no_int_vacc_to_sym_10.rda"
+output_params_path_10 <- file.path(output_params_dir, "uvira_multioutbreak_no_dis_no_int_vacc_to_sym_10.csv")
 ```
 
 ## Model Definition
@@ -2562,7 +2728,7 @@ rw.sd_10 <- rw_sd(
   b_cov = rw.sd_rp,
   f_ai = rw.sd_rp,
   eps_A = rw.sd_rp,
-  vacc_prop = rw.sd_rp,
+  mu_vacc = rw.sd_rp,
   b_covid = rw.sd_rp,
   f_v = rw.sd_rp,
   mu_vev = rw.sd_rp,
@@ -2586,13 +2752,13 @@ ri_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
 b_cov_guesses <- runif(Nreps, min = 2, max = 2000)
 eps_A_guesses <- runif(Nreps, min = 0.01, max = 0.5)
 f_ai_guesses <- runif(Nreps, min = 0.1, max = 0.99)
-vacc_prop_guesses <- runif(Nreps, min = 0.01, max = 1)
+mu_vacc_guesses <- runif(Nreps, min = 0.01, max = 1)
 b_covid_guesses <- runif(Nreps, min = 0.001, max = 1)
 f_v_guesses <- runif(Nreps, min = 0.01, max = 1)
 mu_vev_guesses <- runif(Nreps, min = 1e-3, 200)
 mu_vs_guesses <- runif(Nreps, min = 1e-3, 200)
-mu_ras_guesses <- runif(Nreps, min = 1e-3, max = 300)
-mu_ris_guesses <- runif(Nreps, min = 1e-3, max = 300)
+mu_ras_guesses <- runif(Nreps, min = 1e-3, max = 100)
+mu_ris_guesses <- runif(Nreps, min = 1e-3, max = 100)
 rho_guesses <- runif(Nreps, min = 0.01, max = 1)
 tau_guesses <- runif(Nreps, min = 1e-4, max = 5)
 sigmaSE_guesses <- runif(Nreps, min = 0.01, max = 0.2)
@@ -2609,7 +2775,7 @@ guess_points_10 <- as.data.frame(cbind(
   b_cov = b_cov_guesses,
   eps_A = eps_A_guesses,
   f_ai = f_ai_guesses,
-  vacc_prop = vacc_prop_guesses,
+  mu_vacc = mu_vacc_guesses,
   b_covid = b_covid_guesses,
   f_v = f_v_guesses,
   mu_vev = mu_vev_guesses,
@@ -2678,6 +2844,27 @@ df_results_10 <- global_searches$collect_and_save_loglik(
 
 ### Diagnostic
 
+#### Convergence
+
+```{r}
+(
+  m_global_10
+  %>% traces()
+  %>% melt()
+  %>% ggplot(
+    aes(
+      x=iteration,
+      y=value,
+      group=.L1,
+      color=factor(.L1)
+    )
+  )
+  + geom_line()
+  + guides(color="none")
+  + facet_wrap(~name, scales="free_y")
+)
+```
+
 #### Summary
 
 ```{r}
@@ -2693,7 +2880,7 @@ summary(df_results_10$log_lik, digits=5)
 ```{r}
 #| fig-width: 10
 #| fig-asp: 1
-viz$plot_pairs(guess_points_10, df_results_10)
+viz$plot_pairs(guess_points_10, df_results_10, log_lik_diff = 4)
 ```
 
 #### Simulations from best model
@@ -2708,6 +2895,21 @@ sims_best_10 <- (
   %>% mutate(
     date = df_reports$date[1] + weeks(round(date * 52))
   )
+)
+```
+
+##### Compartments
+
+```{r}
+#| fig-width: 5
+#| fig-height: 4
+
+viz$plot_compartments_sims(df_reports, sims_best_10, c("N", "V"))
+ggsave(
+  filename = file.path(img_dir, "compartments_sim_no_int_10.png"),
+  width = 5,
+  height = 4,
+  units = "in"
 )
 ```
 
@@ -2735,10 +2937,14 @@ ggsave(
 #| fig-width: 7
 #| fig-height: 3
 sims_best_stats_10 <- global_searches$calculate_sim_stats(sims_best_10)
-viz$plot_data_and_summary_sims(
-  df_reports,
-  target = "reports",
-  sims = sims_best_stats_10
+(
+  viz$plot_data_and_summary_sims(
+    df_reports,
+    target = "reports",
+    sims = sims_best_stats_10
+  ) 
+  # + labs(title = "With interventions")
+  # + scale_y_continuous(limits = c(0, 170))
 )
 ggsave(
   filename = file.path(img_dir, "agg_sim_no_int_10.png"),
@@ -2748,7 +2954,7 @@ ggsave(
 )
 ```
 
-# With Separate Recovered, idps, COVID
+# 11. With Separate Recovered, idps, COVID
 
 ```{r}
 output_model_name_11 <- "uvira_multioutbreak_no_dis_no_int_11.rda"
@@ -2813,8 +3019,8 @@ eps_A_guesses <- runif(Nreps, min = 0.01, max = 0.5)
 f_ai_guesses <- runif(Nreps, min = 0.1, max = 0.99)
 b_idps_guesses <- runif(Nreps, min = 0.01, max = 0.99)
 b_covid_guesses <- runif(Nreps, min = 0.001, max = 1)
-mu_ras_guesses <- runif(Nreps, min = 1e-3, max = 300)
-mu_ris_guesses <- runif(Nreps, min = 1e-3, max = 300)
+mu_ras_guesses <- runif(Nreps, min = 1e-3, max = 100)
+mu_ris_guesses <- runif(Nreps, min = 1e-3, max = 100)
 rho_guesses <- runif(Nreps, min = 0.01, max = 1)
 tau_guesses <- runif(Nreps, min = 1e-4, max = 5)
 sigmaSE_guesses <- runif(Nreps, min = 0.01, max = 0.2)
@@ -2884,6 +3090,21 @@ stew(
 )
 ```
 
+### Collect and Save Results
+
+```{r}
+df_results_11 <- global_searches$collect_and_save_loglik(
+  model_search = m_global_11,
+  loglik_values = loglik_global_11,
+  out_filename = output_params_path_11,
+  reset_data = reset_data
+)
+```
+
+### Diagnostic
+
+#### Convergence
+
 ```{r}
 (
   m_global_11
@@ -2903,20 +3124,6 @@ stew(
 )
 ```
 
-
-### Collect and Save Results
-
-```{r}
-df_results_11 <- global_searches$collect_and_save_loglik(
-  model_search = m_global_11,
-  loglik_values = loglik_global_11,
-  out_filename = output_params_path_11,
-  reset_data = reset_data
-)
-```
-
-### Diagnostic
-
 #### Summary
 
 ```{r}
@@ -2932,7 +3139,7 @@ summary(df_results_11$log_lik, digits=5)
 ```{r}
 #| fig-width: 10
 #| fig-asp: 1
-viz$plot_pairs(guess_points_11, df_results_11)
+viz$plot_pairs(guess_points_11, df_results_11, log_lik_diff = 4)
 ```
 
 #### Simulations from best model
@@ -2957,9 +3164,13 @@ sims_best_11 <- (
 #| fig-height: 3
 
 viz$plot_compartments_sims(df_reports, sims_best_11, c("N"))
+ggsave(
+  filename = file.path(img_dir, "compartments_sim_no_int_11.png"),
+  width = 5,
+  height = 3,
+  units = "in"
+)
 ```
-
-
 
 ##### Individual plots
 
@@ -2985,10 +3196,14 @@ ggsave(
 #| fig-width: 7
 #| fig-height: 3
 sims_best_stats_11 <- global_searches$calculate_sim_stats(sims_best_11)
-viz$plot_data_and_summary_sims(
-  df_reports,
-  target = "reports",
-  sims = sims_best_stats_11
+(
+  viz$plot_data_and_summary_sims(
+    df_reports,
+    target = "reports",
+    sims = sims_best_stats_11
+  ) 
+  # + labs(title = "With interventions")
+  # + scale_y_continuous(limits = c(0, 170))
 )
 ggsave(
   filename = file.path(img_dir, "agg_sim_no_int_11.png"),
@@ -2998,7 +3213,7 @@ ggsave(
 )
 ```
 
-# With Separate Recovered, COVID
+# 12. With Separate Recovered, COVID
 
 ```{r}
 output_model_name_12 <- "uvira_multioutbreak_no_dis_no_int_12.rda"
@@ -3062,8 +3277,8 @@ b_cov_guesses <- runif(Nreps, min = 2, max = 2000)
 eps_A_guesses <- runif(Nreps, min = 0.01, max = 0.5)
 f_ai_guesses <- runif(Nreps, min = 0.1, max = 0.99)
 b_covid_guesses <- runif(Nreps, min = 0.001, max = 1)
-mu_ras_guesses <- runif(Nreps, min = 1e-3, max = 300)
-mu_ris_guesses <- runif(Nreps, min = 1e-3, max = 300)
+mu_ras_guesses <- runif(Nreps, min = 1e-3, max = 100)
+mu_ris_guesses <- runif(Nreps, min = 1e-3, max = 100)
 rho_guesses <- runif(Nreps, min = 0.01, max = 1)
 tau_guesses <- runif(Nreps, min = 1e-4, max = 5)
 sigmaSE_guesses <- runif(Nreps, min = 0.01, max = 0.2)
@@ -3161,7 +3376,7 @@ summary(df_results_12$log_lik, digits=5)
 ```{r}
 #| fig-width: 10
 #| fig-asp: 1
-viz$plot_pairs(guess_points_12, df_results_12)
+viz$plot_pairs(guess_points_12, df_results_12, log_lik_diff = 8)
 ```
 
 #### Simulations from best model
@@ -3179,7 +3394,6 @@ sims_best_12 <- (
 )
 ```
 
-
 ##### Compartments
 
 ```{r}
@@ -3187,6 +3401,12 @@ sims_best_12 <- (
 #| fig-height: 3
 
 viz$plot_compartments_sims(df_reports, sims_best_12, c("N"))
+ggsave(
+  filename = file.path(img_dir, "compartments_sim_no_int_12.png"),
+  width = 5,
+  height = 3,
+  units = "in"
+)
 ```
 
 ##### Individual plots
@@ -3213,13 +3433,296 @@ ggsave(
 #| fig-width: 7
 #| fig-height: 3
 sims_best_stats_12 <- global_searches$calculate_sim_stats(sims_best_12)
-viz$plot_data_and_summary_sims(
-  df_reports,
-  target = "reports",
-  sims = sims_best_stats_12
+(
+  viz$plot_data_and_summary_sims(
+    df_reports,
+    target = "reports",
+    sims = sims_best_stats_12
+  ) 
+  # + labs(title = "With interventions")
+  # + scale_y_continuous(limits = c(0, 170))
 )
 ggsave(
   filename = file.path(img_dir, "agg_sim_no_int_12.png"),
+  width = 7,
+  height = 3,
+  units = "in"
+)
+```
+
+# 13. With Separate Recovered, vaccinations, idps, COVID
+
+```{r}
+output_model_name_13 <- "uvira_multioutbreak_no_dis_no_int_vacc_to_sym_13.rda"
+output_params_path_13 <- file.path(output_params_dir, "uvira_multioutbreak_no_dis_no_int_vacc_to_sym_13.csv")
+```
+
+## Model Definition
+
+```{r}
+m_13 <- model_builder$build_pomp_model(
+  data = df_full,
+  use_cov = TRUE,
+  use_cov_intercept = FALSE,
+  use_separate_recovery = TRUE,
+  add_vaccination = TRUE,
+  add_idps = TRUE,
+  add_covid = TRUE
+)
+```
+
+## Global Search
+
+### Search Parameters
+
+#### Search Steps
+
+```{r}
+# Parameters 
+rw.sd_rp <- 0.02
+rw.sd_ivp <- 0.2
+cooling.fraction.50 <- 0.5 # Level of parameter variance after 50% of iterations
+rw.sd_13 <- rw_sd(
+  s_0 = ivp(rw.sd_ivp),
+  e_0 = ivp(rw.sd_ivp),
+  a_0 = ivp(rw.sd_ivp),
+  i_0 = ivp(rw.sd_ivp),
+  ra_0 = ivp(rw.sd_ivp),
+  ri_0 = ivp(rw.sd_ivp),
+  sigmaSE = rw.sd_rp,
+  b_idps = rw.sd_rp,
+  b_cov = rw.sd_rp,
+  f_ai = rw.sd_rp,
+  eps_A = rw.sd_rp,
+  mu_vacc = rw.sd_rp,
+  b_covid = rw.sd_rp,
+  f_v = rw.sd_rp,
+  mu_vev = rw.sd_rp,
+  mu_vs = rw.sd_rp,
+  mu_ras = rw.sd_rp,
+  mu_ris = rw.sd_rp,
+  rho = rw.sd_rp,
+  tau = rw.sd_rp
+)
+```
+
+#### Search Box
+
+```{r}
+s_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+e_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+a_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+i_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+ra_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+ri_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+b_cov_guesses <- runif(Nreps, min = 2, max = 2000)
+eps_A_guesses <- runif(Nreps, min = 0.01, max = 0.5)
+f_ai_guesses <- runif(Nreps, min = 0.1, max = 0.99)
+mu_vacc_guesses <- runif(Nreps, min = 1e-4, max = 100)
+b_idps_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+b_covid_guesses <- runif(Nreps, min = 0.001, max = 1)
+f_v_guesses <- runif(Nreps, min = 0.01, max = 1)
+mu_vev_guesses <- runif(Nreps, min = 1e-3, 200)
+mu_vs_guesses <- runif(Nreps, min = 1e-3, 200)
+mu_ras_guesses <- runif(Nreps, min = 1e-3, max = 100)
+mu_ris_guesses <- runif(Nreps, min = 1e-3, max = 100)
+rho_guesses <- runif(Nreps, min = 0.01, max = 1)
+tau_guesses <- runif(Nreps, min = 1e-4, max = 5)
+sigmaSE_guesses <- runif(Nreps, min = 0.01, max = 0.2)
+
+
+guess_points_13 <- as.data.frame(cbind(
+  s_0 = s_0_guesses,
+  e_0 = e_0_guesses,
+  a_0 = a_0_guesses,
+  i_0 = i_0_guesses,
+  ra_0 = ra_0_guesses,
+  ri_0 = ri_0_guesses,
+  sigmaSE = sigmaSE_guesses,
+  b_cov = b_cov_guesses,
+  eps_A = eps_A_guesses,
+  f_ai = f_ai_guesses,
+  mu_vacc = mu_vacc_guesses,
+  b_idps = b_idps_guesses,
+  b_covid = b_covid_guesses,
+  f_v = f_v_guesses,
+  mu_vev = mu_vev_guesses,
+  mu_vs = mu_vs_guesses,
+  mu_ras = mu_ras_guesses,
+  mu_ris = mu_ris_guesses,
+  tau = tau_guesses,
+  rho = rho_guesses
+))
+```
+
+### Run model
+
+```{r}
+model_params <- coef(m_13)
+fixed_params <- model_params[!(names(model_params) %in% names(guess_points_13))]
+
+stew(
+  file = output_model_name_13, 
+  dir = output_models_dir,
+  expr = {
+    start <- Sys.time()
+    m_global_13 <- foreach (guess=iter(guess_points_13, "row"), .combine=c) %dopar% {
+      (
+        m_13
+        %>% mif2(
+          Np=Np,
+          Nmif=Nmif,
+          params=c(fixed_params, unlist(guess)),
+          cooling.fraction.50 = 0.5,
+          rw.sd = rw.sd_13
+        )
+        %>% mif2(cooling.fraction.50 = 0.1)
+      )
+    }
+    loglik_global_13 <- (
+      foreach(
+        i=1:Nreps,
+        .combine=rbind
+      ) %dopar% {
+        logmeanexp(
+          replicate(
+            Nreps_eval,
+            logLik(pfilter(m_13, params=coef(m_global_13[[i]]), Np=1000))
+          ),
+          se=TRUE
+        )
+      }
+    )
+    end <- Sys.time()
+    cat("Run time of global iterated particle filter: ", as.integer(round(difftime(end, start, units='mins'))), " minutes")
+  }
+)
+```
+
+### Collect and Save Results
+
+```{r}
+df_results_13 <- global_searches$collect_and_save_loglik(
+  model_search = m_global_13,
+  loglik_values = loglik_global_13,
+  out_filename = output_params_path_13,
+  reset_data = reset_data
+)
+```
+
+### Diagnostic
+
+#### Convergence
+
+```{r}
+(
+  m_global_13
+  %>% traces()
+  %>% melt()
+  %>% ggplot(
+    aes(
+      x=iteration,
+      y=value,
+      group=.L1,
+      color=factor(.L1)
+    )
+  )
+  + geom_line()
+  + guides(color="none")
+  + facet_wrap(~name, scales="free_y")
+)
+```
+
+#### Summary
+
+```{r}
+coef(m_global_13[[which.max(loglik_global_13[,1])]])
+```
+
+```{r}
+summary(df_results_13$log_lik, digits=5)
+```
+
+#### Pair plot
+
+```{r}
+#| fig-width: 10
+#| fig-asp: 1
+viz$plot_pairs(guess_points_13, df_results_13, log_lik_diff = 5)
+```
+
+#### Simulations from best model
+
+```{r}
+sims_best_13 <- (
+  global_searches$simulate_best_model(
+    m_global_13,
+    loglik_global_13,
+    nsim = Nsim
+  )
+  %>% mutate(
+    date = df_reports$date[1] + weeks(round(date * 52))
+  )
+)
+```
+
+##### Compartments
+
+```{r}
+#| fig-width: 5
+#| fig-height: 4
+
+viz$plot_compartments_sims(df_reports, sims_best_13, c("N", "V"))
+ggsave(
+  filename = file.path(img_dir, "compartments_sim_no_int_13.png"),
+  width = 5,
+  height = 5,
+  units = "in"
+)
+```
+
+##### Individual plots
+
+```{r}
+#| fig-width: 7
+#| fig-height: 6
+viz$plot_data_and_sample_sims(
+  df_reports,
+  target = "reports",
+  sims = sims_best_13
+)
+ggsave(
+  filename = file.path(img_dir, "ind_sim_no_int_13.png"),
+  width = 7,
+  height = 6,
+  units = "in"
+)
+```
+
+##### Aggregate plot
+
+```{r}
+#| fig-width: 7
+#| fig-height: 3
+sims_best_stats_13 <- global_searches$calculate_sim_stats(sims_best_13)
+(
+  viz$plot_data_and_summary_sims(
+    df_reports,
+    target = "reports",
+    sims = sims_best_stats_13
+  ) 
+  + labs(title = "With interventions")
+  # + theme(
+  #   legend.position = "right"
+  # )
+  + scale_y_continuous(limits = c(0, 170))
+  # + guides(
+  #   color = "none",
+  #   fill = "none"
+  # )
+)
+ggsave(
+  filename = file.path(img_dir, "agg_sim_no_int_13.png"),
   width = 7,
   height = 3,
   units = "in"
@@ -3234,7 +3737,7 @@ ggsave(
 nb_lik <- function(tau) {
   -sum(
     dnbinom(
-      as.vector(obs(m_1)),
+      as.vector(obs(m_13)),
       size = exp(tau[1]),
       prob = exp(tau[2]),
       log = TRUE
@@ -3259,7 +3762,7 @@ nb_mle$par
 
 ```{r}
 arnb <- NegBin$arnb_fit(
-  data = as.vector(obs(m_1)),
+  data = as.vector(obs(m_13)),
   start_vals = c(20, 0.5, 1),
 )
 ```
@@ -3275,7 +3778,7 @@ arnb$ll
 ## ARMA model
 
 ```{r}
-log_y <- log(as.vector(obs(m_1)) + 1)
+log_y <- log(as.vector(obs(m_13)) + 1)
 arma_fit <- arima(
   log_y,
   order=c(2, 0, 2),
@@ -3299,33 +3802,35 @@ arma_fit$coef
 ```{r}
 
 lls <- list(
-  loglik_global_1[,1],
-  loglik_global_2[,1],
-  loglik_global_3[,1],
-  loglik_global_4[,1],
-  loglik_global_5[,1],
+  # loglik_global_1[,1],
+  # loglik_global_2[,1],
+  # loglik_global_3[,1],
+  # loglik_global_4[,1],
+  # loglik_global_5[,1],
   loglik_global_6[,1],
   loglik_global_7[,1],
-  loglik_global_8[,1],
+  # loglik_global_8[,1],
   loglik_global_9[,1],
   loglik_global_10[,1],
   loglik_global_11[,1],
-  loglik_global_12[,1]
+  loglik_global_12[,1],
+  loglik_global_13[,1]
 )
 
 mech_models <- list(
-  m_global_1[[which.max(loglik_global_1[,1])]],
-  m_global_2[[which.max(loglik_global_2[,1])]],
-  m_global_3[[which.max(loglik_global_3[,1])]],
-  m_global_4[[which.max(loglik_global_4[,1])]],
-  m_global_5[[which.max(loglik_global_5[,1])]],
+  # m_global_1[[which.max(loglik_global_1[,1])]],
+  # m_global_2[[which.max(loglik_global_2[,1])]],
+  # m_global_3[[which.max(loglik_global_3[,1])]],
+  # m_global_4[[which.max(loglik_global_4[,1])]],
+  # m_global_5[[which.max(loglik_global_5[,1])]],
   m_global_6[[which.max(loglik_global_6[,1])]],
   m_global_7[[which.max(loglik_global_7[,1])]],
-  m_global_8[[which.max(loglik_global_8[,1])]],
+  # m_global_8[[which.max(loglik_global_8[,1])]],
   m_global_9[[which.max(loglik_global_9[,1])]],
   m_global_10[[which.max(loglik_global_10[,1])]],
   m_global_11[[which.max(loglik_global_11[,1])]],
-  m_global_12[[which.max(loglik_global_12[,1])]]
+  m_global_12[[which.max(loglik_global_12[,1])]],
+  m_global_13[[which.max(loglik_global_13[,1])]]
 )
 
 model_names <- c(
