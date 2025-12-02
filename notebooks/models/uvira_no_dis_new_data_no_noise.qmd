@@ -2637,7 +2637,6 @@ ggsave(
 )
 ```
 
-
 # Benchmarks
 
 ## Negative binomial IID Model

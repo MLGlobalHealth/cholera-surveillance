@@ -133,14 +133,13 @@ simulate_best_model <- function(
 calculate_sim_stats <- function(sims) {
   sims_stats <- (
     sims
-    %>% filter(.id != "data")
     %>% select(.id, date, y)
     %>% group_by(date)
     %>% summarise(
-      q05 = quantile(y, 0.025, na.rm = TRUE),
+      q07 = quantile(y, 0.07, na.rm = TRUE),
       q50 = quantile(y, 0.5, na.rm = TRUE),
       mean = mean(y, na.rm = TRUE),
-      q95 = quantile(y, 0.975, na.rm = TRUE),
+      q93 = quantile(y, 0.93, na.rm = TRUE),
     )
     %>% ungroup()
   )

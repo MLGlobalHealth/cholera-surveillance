@@ -1,0 +1,3123 @@
+---
+title: "Compartment Model"
+format: html
+editor: visual
+---
+
+# Environment Setup
+
+```{r setup}
+# Packages
+library(rprojroot)
+library(tidyverse)
+library(pomp)
+library(foreach)
+library(doParallel)
+library(doRNG)
+library(patchwork)
+library(GGally)
+library(lubridate)
+library(formattable)
+library(htmlwidgets)
+library(htmltools)
+
+# Set Random Seed
+nb_name <-  "Cholera modelling with compartmental models and pomp - no disaster, new data"
+seed <- sum(sapply(str_split(nb_name, pattern = "", simplify = TRUE), FUN = utf8ToInt))
+
+# Parallel Computing
+n_cores <- parallel::detectCores()
+registerDoParallel(n_cores)
+registerDoRNG(seed)
+
+# Folder Structure
+root <- has_file("cholera-surveillance.Rproj")$make_fix_file()
+raw_data_dir <- root("data/raw")
+proc_data_dir <- root("data/processed")
+output_models_dir <- root("models_output/models")
+dir.create(output_models_dir, recursive = TRUE, showWarnings = FALSE)
+output_params_dir <- root("models_output/parameters")
+dir.create(output_params_dir, recursive = TRUE, showWarnings = FALSE)
+img_dir <- root("images")
+dir.create(img_dir, showWarnings = FALSE)
+src_dir <- root("src")
+
+# Local Packages
+model_builder <- new.env()
+source(file.path(src_dir, "model_builder_fix_param_no_buffer.R"), local=model_builder)
+global_searches <- new.env()
+source(file.path(src_dir, "run_global_searches.R"), local=global_searches)
+NegBin <- new.env()
+source(file.path(src_dir, "optimize_arnb.R"), local=NegBin)
+viz <- new.env()
+source(file.path(src_dir, "viz.R"), local=viz)
+```
+
+# Functions
+
+```{r}
+symlog <- function(x) {
+  symlogx <- list()
+  for (i in 1:length(x)) {
+    if (is.na(x[i])) {
+      symlogx[i] <- NA
+    }
+    else if (abs(x[i]) < 1e-5) {
+      symlogx[i] <- x[i]
+    }
+    else if (x[i] > 0) {
+      symlogx[i] <- log(x[i])
+    }
+    else {
+      symlogx[i] <- -log(-x[i])
+    }
+  }
+  return(symlogx)
+}
+
+custom_color_tile <- function(...) {
+  formatter("span",
+    style = function(x) style(
+      display = "block",
+      padding = "0 4px",
+      "border-radius" = "4px",
+      "background-color" = csscolor(gradient(log(as.numeric(x) - min(as.numeric(x)) + 1), ...))))
+}
+
+custom_color_bar <- function(color = "lightblue", min_width = 30, fun = "proportion", ...) {
+  fun <- match.fun(fun)
+  formatter("span",
+    style = function(x) style(
+      display = "inline-block",
+      direction = "rtl",
+      "unicode-bidi" = "plaintext",
+      "border-radius" = "4px",
+      "padding-right" = "2px",
+      "background-color" = csscolor(color),
+      width = percent(fun(as.numeric(x) - min(as.numeric(x)) + min_width, ...))
+    ))
+}
+
+
+normalize <- function(x) {
+  (x - min(x)) / (max(x) - min(x))
+}
+```
+
+# Import Data
+
+IDPS values are not available for the whole time range (i.e. they only start from around March 2018). For now we just assuming that there were no population movements up to that time for simplicity. Another approach would be to limit the investigation to the time period 2018-2024. We also note that these numbers are clearly to large to be realistic as almost all the cit
+
+## Population
+
+```{r}
+# Population
+# uvira_pop <- (
+#   st_read(file.path(proc_data_dir, "uvira_quarters_pop_2016.geojson"))
+#   %>% select(population)
+#   %>% sum()
+# )
+uvira_pop_2016 <- (
+  readxl::read_excel(
+    file.path(raw_data_dir, "annual_population_2016_2022.xlsx"),
+    sheet = "pop_2022"
+  )
+  %>% select("2016")
+  %>% sum()
+)
+```
+
+## Vaccinations
+
+```{r}
+vacc_andrew <- readRDS(file.path(proc_data_dir, "Andrew", "vaccine_coverage.rds"))
+```
+
+## Meta
+
+### Movements 
+
+```{r}
+#Meta - https://partners.facebook.com/data_for_good/data/640679780696161/about/?partner_id=307300860780730
+# fb_mov_files <- list.files(file.path(raw_data_dir, "Meta/movement_distribution_global_2022-12-01_2025-08-01", fsep = "/"))
+# list_fb_mov <- list()
+# for (i in seq(length(fb_mov_files))) {
+#   list_fb_mov[[i]] <- (
+#     read_csv(
+#       file.path(raw_data_dir, "Meta/movement_distribution_global_2022-12-01_2025-08-01", fb_mov_files[i], fsep = "/"),
+#       show_col_types = FALSE
+#     )
+#     %>% filter(
+#       country == "COD",
+#       gadm_name %in% c("Uvira", "Uvira (ville)")
+#     )
+#     %>% select(
+#       date = ds,
+#       gadm_name,
+#       dist_cat = home_to_ping_distance_category,
+#       dist_fraction = distance_category_ping_fraction
+#     )
+#   )
+# }
+```
+
+```{r}
+# df_fb_mov <- (
+#   bind_rows(list_fb_mov)
+#   %>% mutate(
+#     dist_cat_num = case_when(
+#       dist_cat == "0" ~ 0,
+#       dist_cat == "(0, 10)" ~ 5,
+#       dist_cat == "[10, 100)" ~ 50,
+#       dist_cat == "100+" ~ 100
+#     ),
+#     dist = dist_cat_num * dist_fraction
+#   )
+#   %>% group_by(date, gadm_name)
+#   %>% summarise(
+#     dist = sum(dist),
+#     no_mov_prop = dist_fraction[dist_cat_num == 0],
+#     low_mov_prop = dist_fraction[dist_cat_num == 0] + dist_fraction[dist_cat_num == 5],
+#     .groups = "drop"
+#   )
+#   %>% mutate(
+#     dist = zoo::rollmean(dist, k = 14, fill = 0, align = "right"),
+#     no_mov_prop = zoo::rollmean(no_mov_prop, k = 14, fill = 0, align = "right"),
+#     low_mov_prop = zoo::rollmean(low_mov_prop, k = 14, fill = 0, align = "right")
+#   )
+#   %>% filter(
+#     date >= "2023-01-01",
+#     date <= "2024-12-31"
+#   )
+# )
+```
+
+
+### Business Activity
+
+```{r}
+# # Meta - https://partners.facebook.com/data_for_good/data/640679780696161/about/?partner_id=307300860780730
+# fb_bus_files_gadm0 <- list.files(file.path(raw_data_dir, "Meta/business_activity_global_2020-03-01_2022-11-29_gadm0", fsep = "/"))
+# list_fb_bus_gadm0 <- list()
+# for (i in seq(length(fb_bus_files_gadm0))) {
+#   list_fb_bus_gadm0[[i]] <- (
+#     read_csv(
+#       file.path(raw_data_dir, "Meta/business_activity_global_2020-03-01_2022-11-29_gadm0", fb_bus_files_gadm0[i], fsep = "/"),
+#       show_col_types = FALSE
+#     )
+#     %>% filter(
+#       country == "CD",
+#       # gadm1_name == "Sud-Kivu",
+#     )
+#     %>% select(
+#       date = ds,
+#       gadm_name,
+#       business_vertical,
+#       activity_quantile,
+#       activity_percentage
+#     )
+#   )
+# }
+# 
+# fb_bus_files_gadm1 <- list.files(file.path(raw_data_dir, "Meta/business_activity_global_2020-03-01_2022-11-29_gadm1", fsep = "/"))
+# list_fb_bus_gadm1 <- list()
+# for (i in seq(length(fb_bus_files_gadm1))) {
+#   list_fb_bus_gadm1[[i]] <- (
+#     read_csv(
+#       file.path(raw_data_dir, "Meta/business_activity_global_2020-03-01_2022-11-29_gadm1", fb_bus_files_gadm1[i], fsep = "/"),
+#       show_col_types = FALSE
+#     )
+#     %>% filter(
+#       country == "CD",
+#       gadm1_name == "Sud-Kivu",
+#     )
+#     %>% select(
+#       date = ds,
+#       gadm_name,
+#       business_vertical,
+#       activity_quantile,
+#       activity_percentage
+#     )
+#   )
+# }
+```
+
+```{r}
+# df_fb_bus_gadm0 <- (
+#   bind_rows(list_fb_bus_gadm0)
+# )
+# 
+# df_fb_bus_gadm1 <- (
+#   bind_rows(list_fb_bus_gadm1)
+# )
+```
+
+## OCHA - Displaced
+
+https://data.humdata.org/dataset/drc-displacement-deplace-site-assessment-ocha
+
+
+```{r}
+# read_ocha_disp <- function(path_dir, filename) {
+#   out <- (
+#     suppressWarnings(readxl::read_excel(
+#       file.path(raw_data_dir, path_dir, filename, fsep = "/"),
+#       na = "NULL",
+#       sheet = 1
+#     ))
+#     %>% filter(
+#       (admin1_label == "Sud-kivu") | (admin1_label_from == "Sud-kivu")
+#     )
+#     %>% mutate(
+#       movement_date = as.Date(movement_date, format = "YYYY-mm-dd")
+#     )
+#     %>% select(
+#       date = movement_date,
+#       cause_id,
+#       cause = cause_label,
+#       household,
+#       person,
+#       health_zone_label,
+#       health_area_label,
+#       admin1_label,
+#       admin2_label,
+#       health_zone_label_from = hz_label_from,
+#       health_area_label_from = ha_label_from,
+#       admin1_label_from,
+#       admin2_label_from
+#     )
+#   )
+#   return(out)
+# }
+# 
+# read_ocha_disp_alt <- function(path_dir, filename) {
+#   out <- (
+#     suppressWarnings(readxl::read_excel(
+#       file.path(raw_data_dir, path_dir, filename, fsep = "/"),
+#       na = "NULL",
+#       sheet = 1
+#     ))
+#     %>% filter(
+#       (admin1_label == "Sud-kivu") | (admin1_label_from == "Sud-kivu")
+#     )
+#     %>% mutate(
+#       movement_date = as.Date(movement_date, format = "YYYY-mm-dd"),
+#       health_area_label = NA,
+#       ha_label_from = NA
+#     )
+#     %>% select(
+#       date = movement_date,
+#       cause_id,
+#       cause = cause_label,
+#       household,
+#       person,
+#       health_zone_label,
+#       health_area_label,
+#       admin1_label,
+#       admin2_label,
+#       health_zone_label_from = hz_label_from,
+#       health_area_label_from = ha_label_from,
+#       admin1_label_from,
+#       admin2_label_from
+#     )
+#   )
+#   return(out)
+# }
+```
+
+
+```{r}
+# disp_files <- list.files(file.path(raw_data_dir, "displaced", fsep = "/"))
+# list_disp <- list()
+# for (i in seq(length(disp_files))) {
+#   list_disp[[i]] <- (
+#     tryCatch(
+#       read_ocha_disp("displaced", disp_files[i]),
+#       error = function(err) {
+#         out <- read_ocha_disp_alt("displaced", disp_files[i])
+#         return(out)
+#       }
+#     )
+#   )
+# }
+```
+
+```{r}
+
+# health_areas <- c(
+#   "KALUNDU ETAT",
+#   "KILIBULA",
+#   "KABINDULA",
+#   "MUTEREMUKO",
+#   "SONGO",
+#   "NYARUMANGA",
+#   "ROMBE",
+#   "MULONGWE",
+#   "KAKOMBE",
+#   "AZUHURI",
+#   "KIBONDWE", 
+#   "KIKUKA",
+#   "KASENGA ETAT",
+#   "KANVINVIRA",
+#   "RUGENGE",
+#   "KAVIMVIRA",
+#   "KIROMONI"
+# )
+# 
+# df_disp_input <- (
+#   bind_rows(list_disp)
+#   # %>% filter(
+#   #   health_zone_label == "Uvira"
+#   # )
+#   %>% filter(
+#     health_zone_label == "Uvira",
+#     health_area_label %in% health_areas
+#   )
+#   %>% select(date, disp_input = person)
+#   %>% arrange(date)
+#   %>% group_by(date)
+#   %>% summarise(
+#     disp_input = sum(disp_input, na.rm = TRUE)
+#   )
+# )
+# 
+# df_disp_output <- (
+#   bind_rows(list_disp)
+#   # %>% filter(
+#   #   health_zone_label_from == "Uvira"
+#   # )
+#   %>% filter(
+#     health_zone_label_from == "Uvira",
+#     health_area_label_from %in% health_areas
+#   )
+#   %>% select(date, disp_output = person)
+#   %>% arrange(date)
+#   %>% group_by(date)
+#   %>% summarise(
+#     disp_output = sum(disp_output, na.rm = TRUE)
+#   )
+# )
+```
+
+
+
+## OCHA - Returnees
+
+https://data.humdata.org/dataset/drc-displacement-idps-site-assessment-ocha
+
+
+```{r}
+# ret_files <- list.files(file.path(raw_data_dir, "returnees", fsep = "/"))
+# list_ret <- list()
+# for (i in seq(length(ret_files))) {
+#   list_ret[[i]] <- (
+#     tryCatch(
+#       read_ocha_disp("returnees", ret_files[i]),
+#       error = function(err) {
+#         out <- read_ocha_disp_alt("returnees", ret_files[i])
+#         return(out)
+#       }
+#     )
+#   )
+# }
+```
+
+```{r}
+# df_ret_input <- (
+#   bind_rows(list_ret)
+#   # %>% filter(
+#   #   health_zone_label == "Uvira"
+#   # )
+#   %>% filter(
+#     health_zone_label == "Uvira",
+#     health_area_label %in% health_areas
+#   )
+#   %>% select(date, ret_input = person)
+#   %>% arrange(date)
+#   %>% group_by(date)
+#   %>% summarise(
+#     ret_input = sum(ret_input, na.rm = TRUE)
+#   )
+# )
+# 
+# df_ret_output <- (
+#   bind_rows(list_ret)
+#   # %>% filter(
+#   #   health_zone_label_from == "Uvira"
+#   # )
+#   %>% filter(
+#     health_zone_label_from == "Uvira",
+#     health_area_label_from %in% health_areas
+#   )
+#   %>% select(date, ret_output = person)
+#   %>% arrange(date)
+#   %>% group_by(date)
+#   %>% summarise(
+#     ret_output = sum(ret_output, na.rm = TRUE)
+#   )
+# )
+```
+
+## OCHA - Combined Population Movement
+
+```{r}
+
+df_pop_mov <- read_csv(
+  file.path(proc_data_dir, "ocha_population_movements_uvira.csv"),
+  show_col_types = FALSE
+)
+
+# df_pop_mov <- (
+#   df_disp_input
+#   %>% merge(
+#     df_disp_output,
+#     by = "date",
+#     all = TRUE
+#   )
+#   %>% merge(
+#     df_ret_input,
+#     by = "date",
+#     all = TRUE
+#   )
+#   %>% merge(
+#     df_ret_output,
+#     by = "date",
+#     all = TRUE
+#   )
+#   %>% mutate(
+#     disp_input = replace_na(disp_input, 0),
+#     disp_output = replace_na(disp_output, 0),
+#     ret_input = replace_na(ret_input, 0),
+#     ret_output = replace_na(ret_output, 0),
+#     pop_mov = (disp_input + ret_input - disp_output - ret_output)
+#   )
+#   %>% select(
+#     date,
+#     pop_mov
+#   )
+#   %>% complete(
+#     date = seq(min(date), max(date), by = "1 day"),
+#     fill = list(pop_mov = 0)
+#   )
+#   %>% filter(
+#     date >= "2020-01-03"
+#   )
+#   %>% mutate(
+#     date = as.Date(cut(date, "7 days"))
+#   )
+#   %>% group_by(date)
+#   %>% summarise(
+#     pop_mov = sum(pop_mov)
+#   )
+# )
+```
+
+
+```{r}
+(
+  df_pop_mov
+  %>% ggplot()
+  + geom_line(
+    aes(x = date, y = pop_mov)
+  )
+  + theme_linedraw()
+)
+```
+
+## Cholera
+
+```{r}
+df_reports <- (
+  read_csv(
+    # file.path(proc_data_dir, "uvira_chol_cov_week_20250430.csv", fsep = "/"),
+    # file.path(proc_data_dir, "uvira_chol_cov_week_20250501.csv", fsep = "/"),
+    # file.path(proc_data_dir, "uvira_chol_cov_week_20250505.csv", fsep = "/"),
+    # file.path(proc_data_dir, "uvira_chol_cov_week_20250512.csv", fsep = "/"),
+    # file.path(proc_data_dir, "uvira_chol_cov_week_20250711.csv", fsep = "/"),
+    file.path(proc_data_dir, "uvira_chol_cov_week_20250725.csv", fsep = "/"),
+    show_col_types = FALSE
+  )
+  %>% mutate(
+    idps = replace_na(idps, 0) / 7,  # we need to convert to daily numbers
+    dis = num_disaster_affected / max(num_disaster_affected),
+    # covid_lagged = lag(covid_deaths_per_million, n = 2, default = 0),
+    covid_lagged = lag(covid_cases_per_million, n = 2, default = 0),
+    covid_roll = zoo::rollmean(covid_lagged, k = 3, fill = 0, align = "right"),
+    covid = covid_roll / max(covid_roll, na.rm = TRUE),
+    cov = lead(normalize(cov), n = 1, default = NA),  # Normalize and shift the covariate back by one week
+    vacc = if_else(
+      date < "2021-01-01",
+      vacc * 0.63,
+      vacc * 0.725
+    )
+  )
+  # %>% merge(
+  #   df_pop_mov,
+  #   by = "date",
+  #   all.x = TRUE
+  # )
+  # %>% mutate(
+  #   idps = replace_na(pop_mov, 0) / 7
+  # )
+  %>% na.omit()
+  %>% select(
+    date,
+    reports,
+    rdt_confirmed,
+    idps,
+    dis,
+    covid,
+    cov,
+    vacc
+  )
+)
+```
+
+
+
+# Visualizations
+
+```{r}
+# plot(df_reports$date, exp(df_reports$cov_7), type = "l", col = "black")
+plot(df_reports$date, normalize(df_reports$reports), type = "l", col = "black")
+lines(df_reports$date, df_reports$cov, type = "l", col = "red")
+```
+
+## Covariates
+
+```{r}
+#| fig-width: 5
+#| fig-height: 8
+
+min_year <- min(year(df_reports$date))
+max_year <- max(year(df_reports$date))
+years <- seq(min_year, max_year, by = 1)
+num_years <- length(years)
+
+base_plot <- (
+  ggplot(data = df_reports)
+  + theme(
+      panel.background = element_blank(),
+      panel.border = element_rect(fill = NA, color = "black", linewidth = 1),
+      panel.grid = element_blank(),
+      plot.background = element_blank(),
+      plot.title = element_text(size = 14, hjust = 0.5),
+      axis.title = element_text(size = 14),
+      axis.text = element_text(size = 13),
+      axis.ticks.x = element_line(color = c(rep("black", num_years + 1), rep(NA, num_years + 1)))
+  )
+  + scale_x_date(
+      breaks = c(as.Date(paste0(seq(2020, 2025, 1), "-01-01")), as.Date(paste0(seq(2020, 2025, 1), "-07-01"))),
+      labels = c(rep(c(""), 6), rep(seq(2020, 2025, 1))),
+  )
+)
+
+p1 <- (
+  base_plot
+  + geom_line(
+      aes(x = date, y = reports),
+      color = "firebrick",
+      linewidth = 1.2
+  )
+  + labs(
+    x = "Date", 
+    y = "Suspected\ncholera cases"
+  )
+)
+
+p2 <- (
+  base_plot
+  + geom_line(
+    aes(x = date, y = cov),
+    color = "turquoise4",
+    linewidth = 1.2
+  )
+  + labs(
+    x = "Date",
+    y = "Force of\ninfection (norm.)"
+  )
+)
+
+p3 <- (
+  base_plot
+  + geom_line(
+    aes(x = date, y = covid),
+    color = "darkorchid",
+    linewidth = 1.2
+  )
+  + labs(
+    x = "Date",
+    y = "COVID deaths\n(3-week, norm.)"
+  )
+)
+
+p4 <- (
+  base_plot
+  + geom_line(
+    aes(x = date, y = vacc),
+    color = "orange",
+    linewidth = 1.2
+  )
+  + labs(
+    x = "Date",
+    y = "Vaccinations"
+  )
+)
+
+p5 <- (
+  base_plot
+  + geom_line(
+    aes(x = date, y = idps),
+    color = "forestgreen",
+    linewidth = 1.2
+  )
+  + labs(
+    x = "Date",
+    y = "IDPs"
+  )
+)
+
+(
+  (p1 / p2 / p3 / p4 / p5)
+  + plot_layout(
+    axes = "collect"
+  )
+)
+
+ggsave(
+  filename = file.path(img_dir, "model_inputs.png"),
+  width = 6,
+  height = 8,
+  units = "in"
+)
+```
+
+## Cases Distribution
+
+```{r}
+p1 <- (
+  ggplot(data = df_reports)
+  + geom_histogram(
+    aes(x = reports), 
+    binwidth = 1,
+    fill = "cornflowerblue"
+  )
+)
+p2 <- (
+  ggplot(data = df_reports)
+  + geom_histogram(
+    aes(x = rdt_confirmed), 
+    binwidth = 1,
+    fill = "salmon"
+  )
+)
+p1/p2
+```
+
+Maybe the RDT confirmed are zero inflated?
+
+
+## Movement Distribution
+
+```{r}
+# #| fig-width: 5
+# #| fig-height: 7
+
+# p1 <- (
+#   df_fb_mov
+#   %>% ggplot(aes(x = date, y = dist, color = gadm_name))
+#   + geom_line()
+#   + theme_classic()
+# )
+# p2 <- (
+#   df_fb_mov
+#   %>% ggplot(aes(x = date, y = low_mov_prop, color = gadm_name))
+#   + geom_line()
+#   + theme_classic()
+# )
+# p3 <- (
+#   df_fb_mov
+#   %>% ggplot(aes(x = date, y = no_mov_prop, color = gadm_name))
+#   + geom_line()
+#   + theme_classic()
+# )
+# 
+# (
+#   (p1/p2/p3)
+#   + plot_layout(
+#     axes = "collect"
+#   )
+# )
+```
+
+
+## Business Activity
+
+```{r}
+#| fig-width: 8
+#| fig-height: 7
+
+# var_to_plot <- "activity_quantile"
+# if (var_to_plot == "activity_quantile") {
+#   thresh <- 0.5
+#   high_lim <- 1.0
+# } else {
+#   thresh <- 50
+#   high_lim <- 130
+# }
+# business_to_plot <- c(
+#   "All",
+#   "Professional Services",
+#   "Business & Utility Services",
+#   "Public Good",
+#   "Retail"
+# )
+# 
+# p1 <- (
+#   df_fb_bus_gadm0
+#   %>% filter(
+#     business_vertical %in% business_to_plot
+#   )
+#   %>% select(
+#     date,
+#     y = var_to_plot,
+#     business_vertical
+#   )
+#   %>% ggplot(
+#     aes(x = date, y = y)
+#   )
+#   + geom_line(color = "turquoise4", linewidth = 1.3)
+#   + geom_hline(
+#     yintercept = thresh,
+#     linewidth = 1,
+#     linetype = "dashed"
+#   )
+#   + facet_wrap(
+#     ~ business_vertical,
+#     ncol = 1
+#   )
+#   + theme(
+#     panel.background = element_blank(),
+#     panel.grid = element_blank(),
+#     panel.border = element_rect(fill = NA, colour = "black", linewidth = 1.5),
+#     strip.background = element_blank(),
+#     strip.text = element_text(size = 15),
+#     plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+#     axis.title = element_text(size = 15),
+#     axis.text = element_text(size = 14)
+#   )
+#   + scale_y_continuous(limits = c(0, high_lim))
+#   + guides(
+#     color = guide_legend(override.aes = list(linewidth = 4))
+#   )
+#   + labs(
+#     x = "Date",
+#     y = "Activity Quantile",
+#     title = "Whole Country"
+#   )
+# )
+# 
+# p2 <- (
+#   df_fb_bus_gadm1
+#   %>% filter(
+#     business_vertical %in% business_to_plot
+#   )
+#   %>% select(
+#     date,
+#     y = var_to_plot,
+#     business_vertical
+#   )
+#   %>% ggplot(
+#     aes(x = date, y = y)
+#   )
+#   + geom_line(color = "cornflowerblue", linewidth = 1.3)
+#   + geom_hline(
+#     yintercept = thresh,
+#     linewidth = 1,
+#     linetype = "dashed"
+#   )
+#   + facet_wrap(
+#     ~ business_vertical,
+#     ncol = 1
+#   )
+#   + theme(
+#     panel.background = element_blank(),
+#     panel.grid = element_blank(),
+#     panel.border = element_rect(fill = NA, colour = "black", linewidth = 1.5),
+#     strip.background = element_blank(),
+#     strip.text = element_text(size = 15),
+#     plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+#     axis.title = element_text(size = 15),
+#     axis.text = element_text(size = 14)
+#   )
+#   + scale_y_continuous(limits = c(0, high_lim))
+#   + guides(
+#     color = guide_legend(override.aes = list(linewidth = 4))
+#   )
+#   + labs(
+#     x = "Date",
+#     y = "Activity Quantile",
+#     title = "Sud-Kivu"
+#   )
+# )
+# 
+# (
+#   (p1 + p2)
+#   + plot_layout(
+#     axes = "collect"
+#   )
+# )
+```
+
+
+# Computational Parameters
+
+```{r}
+reset_data <- TRUE
+rw.sd_rp <- 0.05
+rw.sd_ivp <- 0.2
+cooling.fraction.50_tune <- 0.5 # perturbations at the end of 50 IF2 iterations are this fraction smaller than they are at first.
+cooling.fraction.50_last <- 0.1 
+run_level <- 2
+
+Np <- switch(run_level, 100, 1e3, 5e3)
+Nmif <- switch(run_level, 20, 100, 400)
+Nreps <- switch(run_level, 10, 20, 100)
+Nreps_eval <- switch(run_level, 2, 10, 20)
+Nsim <- switch(run_level, 50, 100, 500)
+profile_pts <- switch(run_level, 3, 5, 30)
+profile_Nreps <- switch(run_level, 2, 3, 10)
+
+
+# Np <- switch(run_level, 200, 1e3, 5e3)
+# Nmif <- switch(run_level, 50, 200, 400)
+# Nreps_eval <- switch(run_level, 4, 10, 20)
+# Nreps_local <- switch(run_level, 10, 20, 40)
+# Nreps_global <- switch(run_level, 20, 40, 100)
+# Nsim <- switch(run_level, 50, 100, 500)
+# Napproxbayes_p <- switch(run_level, 10000, 20000, 40000)
+# Nbayes_iter <- switch(run_level, 5000, 10000, 40000)
+# profile_pts <- switch(run_level, 3, 5, 30)
+# profile_Nreps <- switch(run_level, 2, 3, 10)
+```
+
+# Parameters
+
+From: https://databank.worldbank.org/reports.aspx?source=2&series=SP.DYN.CBRT.IN&country= Birth and death rates are per person and per DAY (all rates in the model are daily rates). Note that one unit of time is one year and each time step is 1/52 so all times and rates need to be scaled to this. For example, an infectious period of 10 days needs to be expressed as the number of units (1/52): (10/7) \* (1/52). For the same reason birth and death rates that are collected as rate per year they only need to be scaled by the number of people but left as year estimates. The time step 1/52 is then applied during the pomp step.
+
+```{r}
+custom_colors = c(
+  "#f2fdff", 
+  "#65E3ff", 
+  "#ffdcd5", 
+  "#ff7f7f", 
+  # "#71CA97", 
+  "#42A74D",
+  "#DeF7E9"
+)
+
+
+# Birth and death rates
+# From: https://databank.worldbank.org/reports.aspx?source=2&series=SP.DYN.CBRT.IN&country=
+
+df_dem <- tibble(
+  date = df_reports$date[seq(1, length(df_reports$date), length.out=10)],
+  deathrate = c(10.1, 9.9, 9.6, 9.4, 9.5, 9.7, 9.4, 9.4, 9.4, 9.4) / (1000),
+  birthrate = c(43.5, 43.4, 43, 42.7, 42.3, 42, 41.7, 41.3, 41, 40.7) * 1.05 / (1000) # rates are adjusted to better reflect data that Andrew shared
+)
+```
+
+# Full model data
+
+```{r}
+df_full <- (
+  df_reports
+  %>% merge(
+    df_dem,
+    by="date",
+    all.x=TRUE
+  )
+  %>% mutate(
+    date = seq(-1, n()-2, by = 1) / 52,
+    birthrate = zoo::na.approx(birthrate, na.rm=FALSE),  # We interpolated the rates
+    deathrate = zoo::na.approx(deathrate, na.rm=FALSE)
+  )
+)
+```
+
+# 2. With Covariate Modulation
+
+```{r}
+output_model_name_2 <- "uvira_multioutbreak_fixed_param_2.rda"
+output_params_path_2 <- file.path(output_params_dir, "uvira_multioutbreak_fixed_param_2.csv")
+```
+
+## Model Definition
+
+```{r}
+m_2 <- model_builder$build_pomp_model(
+  data = df_full,
+  use_cov = TRUE,
+  use_cov_intercept = FALSE,
+  use_separate_recovery = TRUE
+)
+```
+
+## Global Search
+
+### Search Parameters
+
+#### Search Steps
+
+```{r}
+rw.sd_2 <- rw_sd(
+  s_0 = ivp(rw.sd_ivp),
+  e_0 = ivp(rw.sd_ivp),
+  a_0 = ivp(rw.sd_ivp),
+  i_0 = ivp(rw.sd_ivp),
+  ra_0 = ivp(rw.sd_ivp),
+  ri_0 = ivp(rw.sd_ivp),
+  # r_0 = ivp(rw.sd_ivp),
+  b_cov = rw.sd_rp,
+  eps_A = rw.sd_rp,
+  # mu_ras = rw.sd_rp,
+  # mu_ris = rw.sd_rp,
+  delta_rs = rw.sd_rp,
+  tau = rw.sd_rp,
+  rho = rw.sd_rp,
+  sigmaSE = rw.sd_rp
+)
+```
+
+#### Search Box
+
+```{r}
+sigmaSE_guesses <- runif(Nreps, min = 0.003, max = 0.2)
+s_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+e_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+a_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+i_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+ra_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+ri_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+# r_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+b_cov_guesses <- runif(Nreps, min = 2, max = 5000)
+eps_A_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+# mu_ras_guesses <- runif(Nreps, min = 1e-3, max = 300)
+# mu_ris_guesses <- runif(Nreps, min = 0.05, max = 10)
+delta_rs_guesses <- runif(Nreps, min = 0, max = 10)
+rho_guesses <- runif(Nreps, min = 1e-4, max = 0.99)
+tau_guesses <- runif(Nreps, min = 1e-4, max = 5)
+
+guess_points_2 <- as.data.frame(cbind(
+  sigmaSE = sigmaSE_guesses,
+  s_0 = s_0_guesses,
+  e_0 = e_0_guesses,
+  a_0 = a_0_guesses,
+  i_0 = i_0_guesses,
+  ra_0 = ra_0_guesses,
+  ri_0 = ri_0_guesses,
+  # r_0 = r_0_guesses,
+  b_cov = b_cov_guesses,
+  eps_A = eps_A_guesses,
+  # mu_ras = mu_ras_guesses,
+  # mu_ris = mu_ris_guesses,
+  delta_rs = delta_rs_guesses,
+  tau = tau_guesses,
+  rho = rho_guesses
+))
+```
+
+### Run model
+
+```{r}
+model_params <- coef(m_2)
+fixed_params <- model_params[!(names(model_params) %in% names(guess_points_2))]
+
+stew(
+  file = output_model_name_2, 
+  dir = output_models_dir,
+  expr = {
+    start <- Sys.time()
+    m_global_2 <- foreach (guess=iter(guess_points_2, "row"), .combine=c) %dopar% {
+      (
+        m_2
+        %>% mif2(
+          Np=Np,
+          Nmif=Nmif,
+          params=c(fixed_params, unlist(guess)),
+          cooling.fraction.50 = cooling.fraction.50_tune,
+          rw.sd = rw.sd_2
+        )
+        %>% mif2(cooling.fraction.50 = cooling.fraction.50_last)
+      )
+    }
+    loglik_global_2 <- (
+      foreach(
+        i=1:Nreps,
+        .combine=rbind
+      ) %dopar% {
+        logmeanexp(
+          replicate(
+            Nreps_eval,
+            logLik(pfilter(m_2, params=coef(m_global_2[[i]]), Np=1000))
+          ),
+          se=TRUE
+        )
+      }
+    )
+    end <- Sys.time()
+    cat("Run time of global iterated particle filter: ", as.integer(round(difftime(end, start, units='mins'))), " minutes")
+  }
+)
+```
+
+### Collect and Save Results
+
+```{r}
+df_results_2 <- global_searches$collect_and_save_loglik(
+  model_search = m_global_2,
+  loglik_values = loglik_global_2,
+  out_filename = output_params_path_2,
+  reset_data = reset_data
+)
+```
+
+### Diagnostic
+
+#### Convergence
+
+```{r}
+(
+  m_global_2
+  %>% traces()
+  %>% melt()
+  %>% ggplot(
+    aes(
+      x=iteration,
+      y=value,
+      group=.L1,
+      color=factor(.L1)
+    )
+  )
+  + geom_line()
+  + guides(color="none")
+  + facet_wrap(~name, scales="free_y")
+)
+```
+
+#### Summary
+
+```{r}
+coef(m_global_2[[which.max(loglik_global_2[,1])]])
+```
+
+```{r}
+summary(df_results_2$log_lik, digits=5)
+```
+
+#### Pair plot
+
+```{r}
+#| fig-width: 10
+#| fig-asp: 1
+viz$plot_pairs(guess_points_2, df_results_2, log_lik_diff = 3)
+dev.print(
+  device = png, 
+  filename = file.path(img_dir, "pair_plot_no_int_2.png"),
+  width = 700, 
+  height = 700
+)
+```
+
+#### Simulations from best model
+
+```{r}
+sims_best_2 <- (
+  global_searches$simulate_best_model(
+    m_global_2,
+    loglik_global_2,
+    nsim = Nsim
+  )
+  %>% mutate(
+    date = df_reports$date[1] + weeks(round(date * 52))
+  )
+)
+```
+
+##### Compartments
+
+```{r}
+#| fig-width: 5
+#| fig-height: 6
+
+viz$plot_compartments_sims(df_reports, sims_best_2, c("N", "S", "E"))
+ggsave(
+  filename = file.path(img_dir, "compartments_sim_no_int_2.png"),
+  width = 5,
+  height = 6,
+  units = "in"
+)
+```
+
+##### Individual plots
+
+```{r}
+#| fig-width: 7
+#| fig-height: 6
+viz$plot_data_and_sample_sims(
+  df_reports,
+  target = "reports",
+  sims = sims_best_2
+)
+ggsave(
+  filename = file.path(img_dir, "ind_sim_no_int_2.png"),
+  width = 7,
+  height = 6,
+  units = "in"
+)
+```
+
+##### Aggregate plot
+
+```{r}
+#| fig-width: 7
+#| fig-height: 3
+sims_best_stats_2 <- global_searches$calculate_sim_stats(sims_best_2)
+(
+  viz$plot_data_and_summary_sims(
+    df_reports,
+    target = "reports",
+    sims = sims_best_stats_2
+  )
+  + labs(title = "No interventions")
+  # + scale_y_continuous(limits = c(0, 210))
+)
+ggsave(
+  filename = file.path(img_dir, "agg_sim_no_int_2.png"),
+  width = 7,
+  height = 3,
+  units = "in"
+)
+```
+
+# 6. With IDPS + Separate Recovered
+
+```{r}
+output_model_name_6 <- "uvira_multioutbreak_fixed_param_6.rda"
+output_params_path_6 <- file.path(output_params_dir, "uvira_multioutbreak_fixed_param_6.csv")
+```
+
+## Model Definition
+
+```{r}
+m_6 <- model_builder$build_pomp_model(
+  data = df_full,
+  use_cov = TRUE,
+  use_cov_intercept = FALSE,
+  add_idps = TRUE,
+  use_separate_recovery = TRUE
+)
+```
+
+## Global Search
+
+### Search Parameters
+
+#### Search Steps
+
+```{r}
+rw.sd_6 <- rw_sd(
+  s_0 = ivp(rw.sd_ivp),
+  e_0 = ivp(rw.sd_ivp),
+  a_0 = ivp(rw.sd_ivp),
+  i_0 = ivp(rw.sd_ivp),
+  ra_0 = ivp(rw.sd_ivp),
+  ri_0 = ivp(rw.sd_ivp),
+  # r_0 = ivp(rw.sd_ivp),
+  sigmaSE = rw.sd_rp,
+  b_cov = rw.sd_rp,
+  eps_A = rw.sd_rp,
+  # mu_ras = rw.sd_rp,
+  # mu_ris = rw.sd_rp,
+  delta_rs = rw.sd_rp,
+  rho = rw.sd_rp,
+  b_idps = rw.sd_rp,
+  tau = rw.sd_rp
+)
+```
+
+#### Search Box
+
+```{r}
+s_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+e_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+a_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+i_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+ra_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+ri_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+# r_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+b_cov_guesses <- runif(Nreps, min = 2, max = 5000)
+eps_A_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+# mu_ras_guesses <- runif(Nreps, min = 1e-3, max = 300)
+# mu_ris_guesses <- runif(Nreps, min = 0.05, max = 10)
+delta_rs_guesses <- runif(Nreps, min = 0, max = 10)
+rho_guesses <- runif(Nreps, min = 0.01, max = 1)
+tau_guesses <- runif(Nreps, min = 1e-4, max = 5)
+b_idps_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+sigmaSE_guesses <- runif(Nreps, min = 0.01, max = 0.2)
+
+
+guess_points_6 <- as.data.frame(cbind(
+  s_0 = s_0_guesses,
+  e_0 = e_0_guesses,
+  a_0 = a_0_guesses,
+  i_0 = i_0_guesses,
+  ra_0 = ra_0_guesses,
+  ri_0 = ri_0_guesses,
+  # r_0 = r_0_guesses,
+  sigmaSE = sigmaSE_guesses,
+  b_cov = b_cov_guesses,
+  eps_A = eps_A_guesses,
+  # mu_ras = mu_ras_guesses,
+  # mu_ris = mu_ris_guesses,
+  delta_rs = delta_rs_guesses,
+  tau = tau_guesses,
+  rho = rho_guesses,
+  b_idps = b_idps_guesses
+))
+```
+
+### Run model
+
+```{r}
+model_params <- coef(m_6)
+fixed_params <- model_params[!(names(model_params) %in% names(guess_points_6))]
+
+stew(
+  file = output_model_name_6, 
+  dir = output_models_dir,
+  expr = {
+    start <- Sys.time()
+    m_global_6 <- foreach (guess=iter(guess_points_6, "row"), .combine=c) %dopar% {
+      (
+        m_6
+        %>% mif2(
+          Np=Np,
+          Nmif=Nmif,
+          params=c(fixed_params, unlist(guess)),
+          cooling.fraction.50 = cooling.fraction.50_tune,
+          rw.sd = rw.sd_6
+        )
+        %>% mif2(cooling.fraction.50 = cooling.fraction.50_last)
+      )
+    }
+    loglik_global_6 <- (
+      foreach(
+        i=1:Nreps,
+        .combine=rbind
+      ) %dopar% {
+        logmeanexp(
+          replicate(
+            Nreps_eval,
+            logLik(pfilter(m_6, params=coef(m_global_6[[i]]), Np=1000))
+          ),
+          se=TRUE
+        )
+      }
+    )
+    end <- Sys.time()
+    cat("Run time of global iterated particle filter: ", as.integer(round(difftime(end, start, units='mins'))), " minutes")
+  }
+)
+```
+
+### Collect and Save Results
+
+```{r}
+df_results_6 <- global_searches$collect_and_save_loglik(
+  model_search = m_global_6,
+  loglik_values = loglik_global_6,
+  out_filename = output_params_path_6,
+  reset_data = reset_data
+)
+```
+
+### Diagnostic
+
+#### Convergence
+
+```{r}
+(
+  m_global_6
+  %>% traces()
+  %>% melt()
+  %>% ggplot(
+    aes(
+      x=iteration,
+      y=value,
+      group=.L1,
+      color=factor(.L1)
+    )
+  )
+  + geom_line()
+  + guides(color="none")
+  + facet_wrap(~name, scales="free_y")
+)
+```
+
+#### Summary
+
+```{r}
+coef(m_global_6[[which.max(loglik_global_6[,1])]])
+```
+
+```{r}
+summary(df_results_6$log_lik, digits=5)
+```
+
+#### Pair plot
+
+```{r}
+#| fig-width: 10
+#| fig-asp: 1
+viz$plot_pairs(guess_points_6, df_results_6)
+```
+
+#### Simulations from best model
+
+```{r}
+sims_best_6 <- (
+  global_searches$simulate_best_model(
+    m_global_6,
+    loglik_global_6,
+    nsim = Nsim
+  )
+  %>% mutate(
+    date = df_reports$date[1] + weeks(round(date * 52))
+  )
+)
+```
+
+##### Compartments
+
+```{r}
+#| fig-width: 5
+#| fig-height: 3
+
+viz$plot_compartments_sims(df_reports, sims_best_6, c("N"))
+ggsave(
+  filename = file.path(img_dir, "compartments_sim_no_int_6.png"),
+  width = 5,
+  height = 3,
+  units = "in"
+)
+```
+
+##### Individual plots
+
+```{r}
+#| fig-width: 7
+#| fig-height: 6
+viz$plot_data_and_sample_sims(
+  df_reports,
+  target = "reports",
+  sims = sims_best_6
+)
+ggsave(
+  filename = file.path(img_dir, "ind_sim_no_int_6.png"),
+  width = 7,
+  height = 6,
+  units = "in"
+)
+```
+
+##### Aggregate plot
+
+```{r}
+#| fig-width: 7
+#| fig-height: 3
+sims_best_stats_6 <- global_searches$calculate_sim_stats(sims_best_6)
+viz$plot_data_and_summary_sims(
+  df_reports,
+  target = "reports",
+  sims = sims_best_stats_6
+)
+ggsave(
+  filename = file.path(img_dir, "agg_sim_no_int_6.png"),
+  width = 7,
+  height = 3,
+  units = "in"
+)
+```
+
+# 7. With IDPS + Separate Recovered + vaccinations
+
+```{r}
+output_model_name_7 <- "uvira_multioutbreak_fixed_param_7.rda"
+output_params_path_7 <- file.path(output_params_dir, "uvira_multioutbreak_fixed_param_7.csv")
+```
+
+## Model Definition
+
+```{r}
+m_7 <- model_builder$build_pomp_model(
+  data = df_full,
+  use_cov = TRUE,
+  use_cov_intercept = FALSE,
+  add_idps = TRUE,
+  use_separate_recovery = TRUE,
+  add_vaccination = TRUE
+)
+```
+
+## Global Search
+
+### Search Parameters
+
+#### Search Steps
+
+```{r}
+rw.sd_7 <- rw_sd(
+  s_0 = ivp(rw.sd_ivp),
+  e_0 = ivp(rw.sd_ivp),
+  a_0 = ivp(rw.sd_ivp),
+  i_0 = ivp(rw.sd_ivp),
+  ra_0 = ivp(rw.sd_ivp),
+  ri_0 = ivp(rw.sd_ivp),
+  # r_0 = ivp(rw.sd_ivp),
+  sigmaSE = rw.sd_rp,
+  b_cov = rw.sd_rp,
+  f_v = rw.sd_rp,
+  mu_vs = rw.sd_rp,
+  eps_A = rw.sd_rp,
+  # mu_ras = rw.sd_rp,
+  # mu_ris = rw.sd_rp,
+  delta_rs = rw.sd_rp,
+  # mu_rs = rw.sd_rp,
+  rho = rw.sd_rp,
+  b_idps = rw.sd_rp,
+  tau = rw.sd_rp
+)
+```
+
+#### Search Box
+
+```{r}
+s_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+e_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+a_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+i_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+ra_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+ri_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+# r_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+r_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+b_cov_guesses <- runif(Nreps, min = 2, max = 5000)
+eps_A_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+f_v_guesses <- runif(Nreps, min = 0.01, max = 1)
+mu_vs_guesses <- runif(Nreps, min = 1e-3, 30)
+# mu_ras_guesses <- runif(Nreps, min = 1e-3, max = 300)
+# mu_ris_guesses <- runif(Nreps, min = 0.05, max = 10)
+delta_rs_guesses <- runif(Nreps, min = 0, max = 10)
+# mu_rs_guesses <- runif(Nreps, min = 1e-3, max = 300)
+rho_guesses <- runif(Nreps, min = 0.01, max = 1)
+tau_guesses <- runif(Nreps, min = 1e-4, max = 5)
+b_idps_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+sigmaSE_guesses <- runif(Nreps, min = 0.01, max = 0.2)
+
+
+guess_points_7 <- as.data.frame(cbind(
+  s_0 = s_0_guesses,
+  e_0 = e_0_guesses,
+  a_0 = a_0_guesses,
+  i_0 = i_0_guesses,
+  ra_0 = ra_0_guesses,
+  ri_0 = ri_0_guesses,
+  # r_0 = r_0_guesses,
+  sigmaSE = sigmaSE_guesses,
+  b_cov = b_cov_guesses,
+  eps_A = eps_A_guesses,
+  f_v = f_v_guesses,
+  mu_vs = mu_vs_guesses,
+  # mu_ras = mu_ras_guesses,
+  # mu_ris = mu_ris_guesses,
+  delta_rs = delta_rs_guesses,
+  # mu_rs = mu_rs_guesses,
+  tau = tau_guesses,
+  rho = rho_guesses,
+  b_idps = b_idps_guesses
+))
+```
+
+### Run model
+
+```{r}
+model_params <- coef(m_7)
+fixed_params <- model_params[!(names(model_params) %in% names(guess_points_7))]
+
+stew(
+  file = output_model_name_7, 
+  dir = output_models_dir,
+  expr = {
+    start <- Sys.time()
+    m_global_7 <- foreach (guess=iter(guess_points_7, "row"), .combine=c) %dopar% {
+      (
+        m_7
+        %>% mif2(
+          Np=Np,
+          Nmif=Nmif,
+          params=c(fixed_params, unlist(guess)),
+          cooling.fraction.50 = cooling.fraction.50_tune,
+          rw.sd = rw.sd_7
+        )
+        %>% mif2(cooling.fraction.50 = cooling.fraction.50_last)
+      )
+    }
+    loglik_global_7 <- (
+      foreach(
+        i=1:Nreps,
+        .combine=rbind
+      ) %dopar% {
+        logmeanexp(
+          replicate(
+            Nreps_eval,
+            logLik(pfilter(m_7, params=coef(m_global_7[[i]]), Np=1000))
+          ),
+          se=TRUE
+        )
+      }
+    )
+    end <- Sys.time()
+    cat("Run time of global iterated particle filter: ", as.integer(round(difftime(end, start, units='mins'))), " minutes")
+  }
+)
+```
+
+### Collect and Save Results
+
+```{r}
+df_results_7 <- global_searches$collect_and_save_loglik(
+  model_search = m_global_7,
+  loglik_values = loglik_global_7,
+  out_filename = output_params_path_7,
+  reset_data = reset_data
+)
+```
+
+### Diagnostic
+
+#### Convergence
+
+```{r}
+(
+  m_global_7
+  %>% traces()
+  %>% melt()
+  %>% ggplot(
+    aes(
+      x=iteration,
+      y=value,
+      group=.L1,
+      color=factor(.L1)
+    )
+  )
+  + geom_line()
+  + guides(color="none")
+  + facet_wrap(~name, scales="free_y")
+)
+```
+
+#### Summary
+
+```{r}
+coef(m_global_7[[which.max(loglik_global_7[,1])]])
+```
+
+```{r}
+summary(df_results_7$log_lik, digits=5)
+```
+
+#### Pair plot
+
+```{r}
+#| fig-width: 10
+#| fig-asp: 1
+viz$plot_pairs(guess_points_7, df_results_7)
+```
+
+#### Simulations from best model
+
+```{r}
+sims_best_7 <- (
+  global_searches$simulate_best_model(
+    m_global_7,
+    loglik_global_7,
+    nsim = Nsim
+  )
+  %>% mutate(
+    date = df_reports$date[1] + weeks(round(date * 52))
+  )
+)
+```
+
+##### Compartments
+
+```{r}
+#| fig-width: 5
+#| fig-height: 6
+
+viz$plot_compartments_sims(df_reports, sims_best_7, c("N", "S", "V"))
+ggsave(
+  filename = file.path(img_dir, "compartments_sim_no_int_7.png"),
+  width = 5,
+  height = 4,
+  units = "in"
+)
+```
+
+##### Individual plots
+
+```{r}
+#| fig-width: 7
+#| fig-height: 6
+viz$plot_data_and_sample_sims(
+  df_reports,
+  target = "reports",
+  sims = sims_best_7
+)
+ggsave(
+  filename = file.path(img_dir, "ind_sim_no_int_7.png"),
+  width = 7,
+  height = 6,
+  units = "in"
+)
+```
+
+##### Aggregate plot
+
+```{r}
+#| fig-width: 7
+#| fig-height: 3
+sims_best_stats_7 <- global_searches$calculate_sim_stats(sims_best_7)
+viz$plot_data_and_summary_sims(
+  df_reports,
+  target = "reports",
+  sims = sims_best_stats_7
+)
+ggsave(
+  filename = file.path(img_dir, "agg_sim_no_int_7.png"),
+  width = 7,
+  height = 3,
+  units = "in"
+)
+```
+
+# 9. With Separate Recovered, vaccinations
+
+```{r}
+output_model_name_9 <- "uvira_multioutbreak_fixed_param_9.rda"
+output_params_path_9 <- file.path(output_params_dir, "uvira_multioutbreak_fixed_param_9.csv")
+```
+
+## Model Definition
+
+```{r}
+m_9 <- model_builder$build_pomp_model(
+  data = df_full,
+  use_cov = TRUE,
+  use_cov_intercept = FALSE,
+  use_separate_recovery = TRUE,
+  add_vaccination = TRUE
+)
+```
+
+## Global Search
+
+### Search Parameters
+
+#### Search Steps
+
+```{r}
+rw.sd_9 <- rw_sd(
+  s_0 = ivp(rw.sd_ivp),
+  e_0 = ivp(rw.sd_ivp),
+  a_0 = ivp(rw.sd_ivp),
+  i_0 = ivp(rw.sd_ivp),
+  ra_0 = ivp(rw.sd_ivp),
+  ri_0 = ivp(rw.sd_ivp),
+  # r_0 = ivp(rw.sd_ivp),
+  sigmaSE = rw.sd_rp,
+  b_cov = rw.sd_rp,
+  eps_A = rw.sd_rp,
+  f_v = rw.sd_rp,
+  mu_vs = rw.sd_rp,
+  # mu_ras = rw.sd_rp,
+  # mu_ris = rw.sd_rp,
+  delta_rs = rw.sd_rp,
+  rho = rw.sd_rp,
+  tau = rw.sd_rp
+)
+```
+
+#### Search Box
+
+```{r}
+s_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+e_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+a_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+i_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+ra_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+ri_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+# r_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+b_cov_guesses <- runif(Nreps, min = 2, max = 5000)
+eps_A_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+f_v_guesses <- runif(Nreps, min = 0.01, max = 1)
+mu_vs_guesses <- runif(Nreps, min = 1e-3, 30)
+# mu_ras_guesses <- runif(Nreps, min = 1e-3, max = 300)
+# mu_ris_guesses <- runif(Nreps, min = 0.05, max = 10)
+delta_rs_guesses <- runif(Nreps, min = 0, max = 10)
+rho_guesses <- runif(Nreps, min = 0.01, max = 1)
+tau_guesses <- runif(Nreps, min = 1e-4, max = 5)
+sigmaSE_guesses <- runif(Nreps, min = 0.01, max = 0.2)
+
+
+guess_points_9 <- as.data.frame(cbind(
+  s_0 = s_0_guesses,
+  e_0 = e_0_guesses,
+  a_0 = a_0_guesses,
+  i_0 = i_0_guesses,
+  ra_0 = ra_0_guesses,
+  ri_0 = ri_0_guesses,
+  # r_0 = r_0_guesses,
+  sigmaSE = sigmaSE_guesses,
+  b_cov = b_cov_guesses,
+  eps_A = eps_A_guesses,
+  f_v = f_v_guesses,
+  mu_vs = mu_vs_guesses,
+  # mu_ras = mu_ras_guesses,
+  # mu_ris = mu_ris_guesses,
+  delta_rs = delta_rs_guesses,
+  tau = tau_guesses,
+  rho = rho_guesses
+))
+```
+
+### Run model
+
+```{r}
+model_params <- coef(m_9)
+fixed_params <- model_params[!(names(model_params) %in% names(guess_points_9))]
+
+stew(
+  file = output_model_name_9, 
+  dir = output_models_dir,
+  expr = {
+    start <- Sys.time()
+    m_global_9 <- foreach (guess=iter(guess_points_9, "row"), .combine=c) %dopar% {
+      (
+        m_9
+        %>% mif2(
+          Np=Np,
+          Nmif=Nmif,
+          params=c(fixed_params, unlist(guess)),
+          cooling.fraction.50 = cooling.fraction.50_tune,
+          rw.sd = rw.sd_9
+        )
+        %>% mif2(cooling.fraction.50 = cooling.fraction.50_last)
+      )
+    }
+    loglik_global_9 <- (
+      foreach(
+        i=1:Nreps,
+        .combine=rbind
+      ) %dopar% {
+        logmeanexp(
+          replicate(
+            Nreps_eval,
+            logLik(pfilter(m_9, params=coef(m_global_9[[i]]), Np=1000))
+          ),
+          se=TRUE
+        )
+      }
+    )
+    end <- Sys.time()
+    cat("Run time of global iterated particle filter: ", as.integer(round(difftime(end, start, units='mins'))), " minutes")
+  }
+)
+```
+
+### Collect and Save Results
+
+```{r}
+df_results_9 <- global_searches$collect_and_save_loglik(
+  model_search = m_global_9,
+  loglik_values = loglik_global_9,
+  out_filename = output_params_path_9,
+  reset_data = reset_data
+)
+```
+
+### Diagnostic
+
+#### Convergence
+
+```{r}
+(
+  m_global_9
+  %>% traces()
+  %>% melt()
+  %>% ggplot(
+    aes(
+      x=iteration,
+      y=value,
+      group=.L1,
+      color=factor(.L1)
+    )
+  )
+  + geom_line()
+  + guides(color="none")
+  + facet_wrap(~name, scales="free_y")
+)
+```
+
+#### Summary
+
+```{r}
+coef(m_global_9[[which.max(loglik_global_9[,1])]])
+```
+
+```{r}
+summary(df_results_9$log_lik, digits=5)
+```
+
+#### Pair plot
+
+```{r}
+#| fig-width: 10
+#| fig-asp: 1
+viz$plot_pairs(guess_points_9, df_results_9)
+```
+
+#### Simulations from best model
+
+```{r}
+sims_best_9 <- (
+  global_searches$simulate_best_model(
+    m_global_9,
+    loglik_global_9,
+    nsim = Nsim
+  )
+  %>% mutate(
+    date = df_reports$date[1] + weeks(round(date * 52))
+  )
+)
+```
+
+##### Compartments
+
+```{r}
+#| fig-width: 5
+#| fig-height: 4
+
+viz$plot_compartments_sims(df_reports, sims_best_9, c("N", "S", "V"))
+ggsave(
+  filename = file.path(img_dir, "compartments_sim_no_int_9.png"),
+  width = 5,
+  height = 4,
+  units = "in"
+)
+```
+
+##### Individual plots
+
+```{r}
+#| fig-width: 7
+#| fig-height: 6
+viz$plot_data_and_sample_sims(
+  df_reports,
+  target = "reports",
+  sims = sims_best_9
+)
+ggsave(
+  filename = file.path(img_dir, "ind_sim_no_int_9.png"),
+  width = 7,
+  height = 6,
+  units = "in"
+)
+```
+
+##### Aggregate plot
+
+```{r}
+#| fig-width: 7
+#| fig-height: 3
+sims_best_stats_9 <- global_searches$calculate_sim_stats(sims_best_9)
+viz$plot_data_and_summary_sims(
+  df_reports,
+  target = "reports",
+  sims = sims_best_stats_9
+)
+ggsave(
+  filename = file.path(img_dir, "agg_sim_no_int_9.png"),
+  width = 7,
+  height = 3,
+  units = "in"
+)
+```
+
+# 10. With Separate Recovered, vaccinations, COVID
+
+```{r}
+output_model_name_10 <- "uvira_multioutbreak_fixed_param_10.rda"
+output_params_path_10 <- file.path(output_params_dir, "uvira_multioutbreak_fixed_param_10.csv")
+```
+
+## Model Definition
+
+```{r}
+m_10 <- model_builder$build_pomp_model(
+  data = df_full,
+  use_cov = TRUE,
+  use_cov_intercept = FALSE,
+  use_separate_recovery = TRUE,
+  add_vaccination = TRUE,
+  add_covid = TRUE
+)
+```
+
+## Global Search
+
+### Search Parameters
+
+#### Search Steps
+
+```{r}
+rw.sd_10 <- rw_sd(
+  s_0 = ivp(rw.sd_ivp),
+  e_0 = ivp(rw.sd_ivp),
+  a_0 = ivp(rw.sd_ivp),
+  i_0 = ivp(rw.sd_ivp),
+  ra_0 = ivp(rw.sd_ivp),
+  ri_0 = ivp(rw.sd_ivp),
+  # r_0 = ivp(rw.sd_ivp),
+  sigmaSE = rw.sd_rp,
+  b_cov = rw.sd_rp,
+  eps_A = rw.sd_rp,
+  b_covid = rw.sd_rp,
+  f_v = rw.sd_rp,
+  mu_vs = rw.sd_rp,
+  # mu_ras = rw.sd_rp,
+  # mu_ris = rw.sd_rp,
+  delta_rs = rw.sd_rp,
+  rho = rw.sd_rp,
+  tau = rw.sd_rp
+)
+```
+
+#### Search Box
+
+```{r}
+s_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+e_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+a_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+i_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+ra_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+ri_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+# r_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+b_cov_guesses <- runif(Nreps, min = 2, max = 5000)
+eps_A_guesses <- runif(Nreps, min = 0.01, max = 1)
+b_covid_guesses <- runif(Nreps, min = 0.001, max = 1)
+f_v_guesses <- runif(Nreps, min = 0.01, max = 1)
+mu_vs_guesses <- runif(Nreps, min = 1e-3, 30)
+# mu_ras_guesses <- runif(Nreps, min = 1e-3, max = 100)
+# mu_ris_guesses <- runif(Nreps, min = 0.05, max = 10)
+delta_rs_guesses <- runif(Nreps, min = 0, max = 10)
+rho_guesses <- runif(Nreps, min = 0.01, max = 1)
+tau_guesses <- runif(Nreps, min = 1e-4, max = 5)
+sigmaSE_guesses <- runif(Nreps, min = 0.01, max = 0.2)
+
+
+guess_points_10 <- as.data.frame(cbind(
+  s_0 = s_0_guesses,
+  e_0 = e_0_guesses,
+  a_0 = a_0_guesses,
+  i_0 = i_0_guesses,
+  ra_0 = ra_0_guesses,
+  ri_0 = ri_0_guesses,
+  # r_0 = r_0_guesses,
+  sigmaSE = sigmaSE_guesses,
+  b_cov = b_cov_guesses,
+  eps_A = eps_A_guesses,
+  b_covid = b_covid_guesses,
+  f_v = f_v_guesses,
+  mu_vs = mu_vs_guesses,
+  # mu_ras = mu_ras_guesses,
+  # mu_ris = mu_ris_guesses,
+  delta_rs = delta_rs_guesses,
+  tau = tau_guesses,
+  rho = rho_guesses
+))
+```
+
+### Run model
+
+```{r}
+model_params <- coef(m_10)
+fixed_params <- model_params[!(names(model_params) %in% names(guess_points_10))]
+
+stew(
+  file = output_model_name_10, 
+  dir = output_models_dir,
+  expr = {
+    start <- Sys.time()
+    m_global_10 <- foreach (guess=iter(guess_points_10, "row"), .combine=c) %dopar% {
+      (
+        m_10
+        %>% mif2(
+          Np=Np,
+          Nmif=Nmif,
+          params=c(fixed_params, unlist(guess)),
+          cooling.fraction.50 = cooling.fraction.50_tune,
+          rw.sd = rw.sd_10
+        )
+        %>% mif2(cooling.fraction.50 = cooling.fraction.50_last)
+      )
+    }
+    loglik_global_10 <- (
+      foreach(
+        i=1:Nreps,
+        .combine=rbind
+      ) %dopar% {
+        logmeanexp(
+          replicate(
+            Nreps_eval,
+            logLik(pfilter(m_10, params=coef(m_global_10[[i]]), Np=1000))
+          ),
+          se=TRUE
+        )
+      }
+    )
+    end <- Sys.time()
+    cat("Run time of global iterated particle filter: ", as.integer(round(difftime(end, start, units='mins'))), " minutes")
+  }
+)
+```
+
+### Collect and Save Results
+
+```{r}
+df_results_10 <- global_searches$collect_and_save_loglik(
+  model_search = m_global_10,
+  loglik_values = loglik_global_10,
+  out_filename = output_params_path_10,
+  reset_data = reset_data
+)
+```
+
+### Diagnostic
+
+#### Convergence
+
+```{r}
+(
+  m_global_10
+  %>% traces()
+  %>% melt()
+  %>% ggplot(
+    aes(
+      x=iteration,
+      y=value,
+      group=.L1,
+      color=factor(.L1)
+    )
+  )
+  + geom_line()
+  + guides(color="none")
+  + facet_wrap(~name, scales="free_y")
+)
+```
+
+#### Summary
+
+```{r}
+coef(m_global_10[[which.max(loglik_global_10[,1])]])
+```
+
+```{r}
+summary(df_results_10$log_lik, digits=5)
+```
+
+#### Pair plot
+
+```{r}
+#| fig-width: 10
+#| fig-asp: 1
+viz$plot_pairs(guess_points_10, df_results_10, log_lik_diff = 4)
+```
+
+#### Simulations from best model
+
+```{r}
+sims_best_10 <- (
+  global_searches$simulate_best_model(
+    m_global_10,
+    loglik_global_10,
+    nsim = Nsim
+  )
+  %>% mutate(
+    date = df_reports$date[1] + weeks(round(date * 52))
+  )
+)
+```
+
+##### Compartments
+
+```{r}
+#| fig-width: 5
+#| fig-height: 4
+
+viz$plot_compartments_sims(df_reports, sims_best_10, c("N", "V"))
+ggsave(
+  filename = file.path(img_dir, "compartments_sim_no_int_10.png"),
+  width = 5,
+  height = 4,
+  units = "in"
+)
+```
+
+##### Individual plots
+
+```{r}
+#| fig-width: 7
+#| fig-height: 6
+viz$plot_data_and_sample_sims(
+  df_reports,
+  target = "reports",
+  sims = sims_best_10
+)
+ggsave(
+  filename = file.path(img_dir, "ind_sim_no_int_10.png"),
+  width = 7,
+  height = 6,
+  units = "in"
+)
+```
+
+##### Aggregate plot
+
+```{r}
+#| fig-width: 7
+#| fig-height: 3
+sims_best_stats_10 <- global_searches$calculate_sim_stats(sims_best_10)
+(
+  viz$plot_data_and_summary_sims(
+    df_reports,
+    target = "reports",
+    sims = sims_best_stats_10
+  ) 
+  # + labs(title = "With interventions")
+  # + scale_y_continuous(limits = c(0, 170))
+)
+ggsave(
+  filename = file.path(img_dir, "agg_sim_no_int_10.png"),
+  width = 7,
+  height = 3,
+  units = "in"
+)
+```
+
+# 11. With Separate Recovered, idps, COVID
+
+```{r}
+output_model_name_11 <- "uvira_multioutbreak_fixed_param_11.rda"
+output_params_path_11 <- file.path(output_params_dir, "uvira_multioutbreak_fixed_param_11.csv")
+```
+
+## Model Definition
+
+```{r}
+m_11 <- model_builder$build_pomp_model(
+  data = df_full,
+  use_cov = TRUE,
+  use_cov_intercept = FALSE,
+  use_separate_recovery = TRUE,
+  add_idps = TRUE,
+  add_covid = TRUE
+)
+```
+
+## Global Search
+
+### Search Parameters
+
+#### Search Steps
+
+```{r}
+rw.sd_11 <- rw_sd(
+  s_0 = ivp(rw.sd_ivp),
+  e_0 = ivp(rw.sd_ivp),
+  a_0 = ivp(rw.sd_ivp),
+  i_0 = ivp(rw.sd_ivp),
+  ra_0 = ivp(rw.sd_ivp),
+  ri_0 = ivp(rw.sd_ivp),
+  # r_0 = ivp(rw.sd_ivp),
+  sigmaSE = rw.sd_rp,
+  b_cov = rw.sd_rp,
+  eps_A = rw.sd_rp,
+  b_idps = rw.sd_rp,
+  b_covid = rw.sd_rp,
+  # mu_ras = rw.sd_rp,
+  # mu_ris = rw.sd_rp,
+  delta_rs = rw.sd_rp,
+  rho = rw.sd_rp,
+  tau = rw.sd_rp
+)
+```
+
+#### Search Box
+
+```{r}
+s_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+e_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+a_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+i_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+ra_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+ri_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+# r_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+b_cov_guesses <- runif(Nreps, min = 2, max = 5000)
+eps_A_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+b_idps_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+b_covid_guesses <- runif(Nreps, min = 0.001, max = 1)
+# mu_ras_guesses <- runif(Nreps, min = 1e-3, max = 100)
+# mu_ris_guesses <- runif(Nreps, min = 0.05, max = 10)
+delta_rs_guesses <- runif(Nreps, min = 0, max = 10)
+rho_guesses <- runif(Nreps, min = 0.01, max = 1)
+tau_guesses <- runif(Nreps, min = 1e-4, max = 5)
+sigmaSE_guesses <- runif(Nreps, min = 0.01, max = 0.2)
+
+
+guess_points_11 <- as.data.frame(cbind(
+  s_0 = s_0_guesses,
+  e_0 = e_0_guesses,
+  a_0 = a_0_guesses,
+  i_0 = i_0_guesses,
+  ra_0 = ra_0_guesses,
+  ri_0 = ri_0_guesses,
+  # r_0 = r_0_guesses,
+  sigmaSE = sigmaSE_guesses,
+  b_cov = b_cov_guesses,
+  eps_A = eps_A_guesses,
+  b_idps = b_idps_guesses,
+  b_covid = b_covid_guesses,
+  # mu_ras = mu_ras_guesses,
+  # mu_ris = mu_ris_guesses,
+  delta_rs = delta_rs_guesses,
+  tau = tau_guesses,
+  rho = rho_guesses
+))
+```
+
+### Run model
+
+```{r}
+model_params <- coef(m_11)
+fixed_params <- model_params[!(names(model_params) %in% names(guess_points_11))]
+
+stew(
+  file = output_model_name_11, 
+  dir = output_models_dir,
+  expr = {
+    start <- Sys.time()
+    m_global_11 <- foreach (guess=iter(guess_points_11, "row"), .combine=c) %dopar% {
+      (
+        m_11
+        %>% mif2(
+          Np=Np,
+          Nmif=Nmif,
+          params=c(fixed_params, unlist(guess)),
+          cooling.fraction.50 = cooling.fraction.50_tune,
+          rw.sd = rw.sd_11
+        )
+        %>% mif2(cooling.fraction.50 = cooling.fraction.50_last)
+      )
+    }
+    loglik_global_11 <- (
+      foreach(
+        i=1:Nreps,
+        .combine=rbind
+      ) %dopar% {
+        logmeanexp(
+          replicate(
+            Nreps_eval,
+            logLik(pfilter(m_11, params=coef(m_global_11[[i]]), Np=1000))
+          ),
+          se=TRUE
+        )
+      }
+    )
+    end <- Sys.time()
+    cat("Run time of global iterated particle filter: ", as.integer(round(difftime(end, start, units='mins'))), " minutes")
+  }
+)
+```
+
+### Collect and Save Results
+
+```{r}
+df_results_11 <- global_searches$collect_and_save_loglik(
+  model_search = m_global_11,
+  loglik_values = loglik_global_11,
+  out_filename = output_params_path_11,
+  reset_data = reset_data
+)
+```
+
+### Diagnostic
+
+#### Convergence
+
+```{r}
+(
+  m_global_11
+  %>% traces()
+  %>% melt()
+  %>% ggplot(
+    aes(
+      x=iteration,
+      y=value,
+      group=.L1,
+      color=factor(.L1)
+    )
+  )
+  + geom_line()
+  + guides(color="none")
+  + facet_wrap(~name, scales="free_y")
+)
+```
+
+#### Summary
+
+```{r}
+coef(m_global_11[[which.max(loglik_global_11[,1])]])
+```
+
+```{r}
+summary(df_results_11$log_lik, digits=5)
+```
+
+#### Pair plot
+
+```{r}
+#| fig-width: 10
+#| fig-asp: 1
+viz$plot_pairs(guess_points_11, df_results_11, log_lik_diff = 4)
+```
+
+#### Simulations from best model
+
+```{r}
+sims_best_11 <- (
+  global_searches$simulate_best_model(
+    m_global_11,
+    loglik_global_11,
+    nsim = Nsim
+  )
+  %>% mutate(
+    date = df_reports$date[1] + weeks(round(date * 52))
+  )
+)
+```
+
+##### Compartments
+
+```{r}
+#| fig-width: 5
+#| fig-height: 3
+
+viz$plot_compartments_sims(df_reports, sims_best_11, c("N"))
+ggsave(
+  filename = file.path(img_dir, "compartments_sim_no_int_11.png"),
+  width = 5,
+  height = 3,
+  units = "in"
+)
+```
+
+##### Individual plots
+
+```{r}
+#| fig-width: 7
+#| fig-height: 6
+viz$plot_data_and_sample_sims(
+  df_reports,
+  target = "reports",
+  sims = sims_best_11
+)
+ggsave(
+  filename = file.path(img_dir, "ind_sim_no_int_11.png"),
+  width = 7,
+  height = 6,
+  units = "in"
+)
+```
+
+##### Aggregate plot
+
+```{r}
+#| fig-width: 7
+#| fig-height: 3
+sims_best_stats_11 <- global_searches$calculate_sim_stats(sims_best_11)
+(
+  viz$plot_data_and_summary_sims(
+    df_reports,
+    target = "reports",
+    sims = sims_best_stats_11
+  ) 
+  # + labs(title = "With interventions")
+  # + scale_y_continuous(limits = c(0, 170))
+)
+ggsave(
+  filename = file.path(img_dir, "agg_sim_no_int_11.png"),
+  width = 7,
+  height = 3,
+  units = "in"
+)
+```
+
+# 12. With Separate Recovered, COVID
+
+```{r}
+output_model_name_12 <- "uvira_multioutbreak_fixed_param_12.rda"
+output_params_path_12 <- file.path(output_params_dir, "uvira_multioutbreak_fixed_param_12.csv")
+```
+
+## Model Definition
+
+```{r}
+m_12 <- model_builder$build_pomp_model(
+  data = df_full,
+  use_cov = TRUE,
+  use_cov_intercept = FALSE,
+  use_separate_recovery = TRUE,
+  add_covid = TRUE
+)
+```
+
+## Global Search
+
+### Search Parameters
+
+#### Search Steps
+
+```{r}
+rw.sd_12 <- rw_sd(
+  s_0 = ivp(rw.sd_ivp),
+  e_0 = ivp(rw.sd_ivp),
+  a_0 = ivp(rw.sd_ivp),
+  i_0 = ivp(rw.sd_ivp),
+  ra_0 = ivp(rw.sd_ivp),
+  ri_0 = ivp(rw.sd_ivp),
+  # r_0 = ivp(rw.sd_ivp),
+  sigmaSE = rw.sd_rp,
+  b_cov = rw.sd_rp,
+  eps_A = rw.sd_rp,
+  b_covid = rw.sd_rp,
+  # mu_ras = rw.sd_rp,
+  # mu_ris = rw.sd_rp,
+  delta_rs = rw.sd_rp,
+  rho = rw.sd_rp,
+  tau = rw.sd_rp
+)
+```
+
+#### Search Box
+
+```{r}
+s_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+e_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+a_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+i_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+ra_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+ri_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+# r_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+b_cov_guesses <- runif(Nreps, min = 2, max = 5000)
+eps_A_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+b_covid_guesses <- runif(Nreps, min = 0.001, max = 1)
+# mu_ras_guesses <- runif(Nreps, min = 1e-3, max = 100)
+# mu_ris_guesses <- runif(Nreps, min = 0.05, max = 10)
+delta_rs_guesses <- runif(Nreps, min = 0, max = 10)
+rho_guesses <- runif(Nreps, min = 0.01, max = 1)
+tau_guesses <- runif(Nreps, min = 1e-4, max = 5)
+sigmaSE_guesses <- runif(Nreps, min = 0.01, max = 0.2)
+
+
+guess_points_12 <- as.data.frame(cbind(
+  s_0 = s_0_guesses,
+  e_0 = e_0_guesses,
+  a_0 = a_0_guesses,
+  i_0 = i_0_guesses,
+  ra_0 = ra_0_guesses,
+  ri_0 = ri_0_guesses,
+  # r_0 = r_0_guesses,
+  sigmaSE = sigmaSE_guesses,
+  b_cov = b_cov_guesses,
+  eps_A = eps_A_guesses,
+  b_covid = b_covid_guesses,
+  # mu_ras = mu_ras_guesses,
+  # mu_ris = mu_ris_guesses,
+  delta_rs = delta_rs_guesses,
+  tau = tau_guesses,
+  rho = rho_guesses
+))
+```
+
+### Run model
+
+```{r}
+model_params <- coef(m_12)
+fixed_params <- model_params[!(names(model_params) %in% names(guess_points_12))]
+
+stew(
+  file = output_model_name_12, 
+  dir = output_models_dir,
+  expr = {
+    start <- Sys.time()
+    m_global_12 <- foreach (guess=iter(guess_points_12, "row"), .combine=c) %dopar% {
+      (
+        m_12
+        %>% mif2(
+          Np=Np,
+          Nmif=Nmif,
+          params=c(fixed_params, unlist(guess)),
+          cooling.fraction.50 = cooling.fraction.50_tune,
+          rw.sd = rw.sd_12
+        )
+        %>% mif2(cooling.fraction.50 = cooling.fraction.50_last)
+      )
+    }
+    loglik_global_12 <- (
+      foreach(
+        i=1:Nreps,
+        .combine=rbind 
+      ) %dopar% {
+        logmeanexp(
+          replicate(
+            Nreps_eval,
+            logLik(pfilter(m_12, params=coef(m_global_12[[i]]), Np=1000))
+          ),
+          se=TRUE
+        )
+      }
+    )
+    end <- Sys.time()
+    cat("Run time of global iterated particle filter: ", as.integer(round(difftime(end, start, units='mins'))), " minutes")
+  }
+)
+```
+
+### Collect and Save Results
+
+```{r}
+df_results_12 <- global_searches$collect_and_save_loglik(
+  model_search = m_global_12,
+  loglik_values = loglik_global_12,
+  out_filename = output_params_path_12,
+  reset_data = reset_data
+)
+```
+
+### Diagnostic
+
+#### Summary
+
+```{r}
+coef(m_global_12[[which.max(loglik_global_12[,1])]])
+```
+
+```{r}
+summary(df_results_12$log_lik, digits=5)
+```
+
+#### Pair plot
+
+```{r}
+#| fig-width: 10
+#| fig-asp: 1
+viz$plot_pairs(guess_points_12, df_results_12, log_lik_diff = 8)
+```
+
+#### Simulations from best model
+
+```{r}
+sims_best_12 <- (
+  global_searches$simulate_best_model(
+    m_global_12,
+    loglik_global_12,
+    nsim = Nsim
+  )
+  %>% mutate(
+    date = df_reports$date[1] + weeks(round(date * 52))
+  )
+)
+```
+
+##### Compartments
+
+```{r}
+#| fig-width: 5
+#| fig-height: 3
+
+viz$plot_compartments_sims(df_reports, sims_best_12, c("N", "S"))
+ggsave(
+  filename = file.path(img_dir, "compartments_sim_no_int_12.png"),
+  width = 5,
+  height = 3,
+  units = "in"
+)
+```
+
+##### Individual plots
+
+```{r}
+#| fig-width: 7
+#| fig-height: 6
+viz$plot_data_and_sample_sims(
+  df_reports,
+  target = "reports",
+  sims = sims_best_12
+)
+ggsave(
+  filename = file.path(img_dir, "ind_sim_no_int_12.png"),
+  width = 7,
+  height = 6,
+  units = "in"
+)
+```
+
+##### Aggregate plot
+
+```{r}
+#| fig-width: 7
+#| fig-height: 3
+sims_best_stats_12 <- global_searches$calculate_sim_stats(sims_best_12)
+(
+  viz$plot_data_and_summary_sims(
+    df_reports,
+    target = "reports",
+    sims = sims_best_stats_12
+  ) 
+  # + labs(title = "With interventions")
+  # + scale_y_continuous(limits = c(0, 170))
+)
+ggsave(
+  filename = file.path(img_dir, "agg_sim_no_int_12.png"),
+  width = 7,
+  height = 3,
+  units = "in"
+)
+```
+
+# 13. With Separate Recovered, vaccinations, idps, COVID
+
+```{r}
+output_model_name_13 <- "uvira_multioutbreak_fixed_param_13.rda"
+output_params_path_13 <- file.path(output_params_dir, "uvira_multioutbreak_fixed_param_13.csv")
+```
+
+## Model Definition
+
+```{r}
+m_13 <- model_builder$build_pomp_model(
+  data = df_full,
+  use_cov = TRUE,
+  use_cov_intercept = FALSE,
+  use_separate_recovery = TRUE,
+  add_vaccination = TRUE,
+  add_idps = TRUE,
+  add_covid = TRUE
+)
+```
+
+## Global Search
+
+### Search Parameters
+
+#### Search Steps
+
+```{r}
+rw.sd_13 <- rw_sd(
+  s_0 = ivp(rw.sd_ivp),
+  e_0 = ivp(rw.sd_ivp),
+  a_0 = ivp(rw.sd_ivp),
+  i_0 = ivp(rw.sd_ivp),
+  ra_0 = ivp(rw.sd_ivp),
+  ri_0 = ivp(rw.sd_ivp),
+  # r_0 = ivp(rw.sd_ivp),
+  sigmaSE = rw.sd_rp,
+  b_idps = rw.sd_rp,
+  b_cov = rw.sd_rp,
+  eps_A = rw.sd_rp,
+  b_covid = rw.sd_rp,
+  f_v = rw.sd_rp,
+  mu_vs = rw.sd_rp,
+  # mu_ras = rw.sd_rp,
+  # mu_ris = rw.sd_rp,
+  delta_rs = rw.sd_rp,
+  rho = rw.sd_rp,
+  tau = rw.sd_rp
+)
+```
+
+#### Search Box
+
+```{r}
+s_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+e_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+a_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+i_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+ra_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+ri_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+# r_0_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+b_cov_guesses <- runif(Nreps, min = 2, max = 5000)
+eps_A_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+b_idps_guesses <- runif(Nreps, min = 0.01, max = 0.99)
+b_covid_guesses <- runif(Nreps, min = 0.001, max = 1)
+f_v_guesses <- runif(Nreps, min = 0.01, max = 1)
+mu_vs_guesses <- runif(Nreps, min = 1e-3, 30)
+# mu_ras_guesses <- runif(Nreps, min = 1e-3, max = 100)
+# mu_ris_guesses <- runif(Nreps, min = 0.05, max = 10)
+delta_rs_guesses <- runif(Nreps, min = 0, max = 10)
+rho_guesses <- runif(Nreps, min = 0.01, max = 1)
+tau_guesses <- runif(Nreps, min = 1e-4, max = 5)
+sigmaSE_guesses <- runif(Nreps, min = 0.01, max = 0.2)
+
+
+guess_points_13 <- as.data.frame(cbind(
+  s_0 = s_0_guesses,
+  e_0 = e_0_guesses,
+  a_0 = a_0_guesses,
+  i_0 = i_0_guesses,
+  ra_0 = ra_0_guesses,
+  ri_0 = ri_0_guesses,
+  # r_0 = r_0_guesses,
+  sigmaSE = sigmaSE_guesses,
+  b_cov = b_cov_guesses,
+  eps_A = eps_A_guesses,
+  b_idps = b_idps_guesses,
+  b_covid = b_covid_guesses,
+  f_v = f_v_guesses,
+  mu_vs = mu_vs_guesses,
+  # mu_ras = mu_ras_guesses,
+  # mu_ris = mu_ris_guesses,
+  delta_rs = delta_rs_guesses,
+  tau = tau_guesses,
+  rho = rho_guesses
+))
+```
+
+### Run model
+
+```{r}
+model_params <- coef(m_13)
+fixed_params <- model_params[!(names(model_params) %in% names(guess_points_13))]
+
+stew(
+  file = output_model_name_13, 
+  dir = output_models_dir,
+  expr = {
+    start <- Sys.time()
+    m_global_13 <- foreach (guess=iter(guess_points_13, "row"), .combine=c) %dopar% {
+      (
+        m_13
+        %>% mif2(
+          Np=Np,
+          Nmif=Nmif,
+          params=c(fixed_params, unlist(guess)),
+          cooling.fraction.50 = cooling.fraction.50_tune,
+          rw.sd = rw.sd_13
+        )
+        %>% mif2(cooling.fraction.50 = cooling.fraction.50_last)
+      )
+    }
+    loglik_global_13 <- (
+      foreach(
+        i=1:Nreps,
+        .combine=rbind
+      ) %dopar% {
+        logmeanexp(
+          replicate(
+            Nreps_eval,
+            logLik(pfilter(m_13, params=coef(m_global_13[[i]]), Np=1000))
+          ),
+          se=TRUE
+        )
+      }
+    )
+    end <- Sys.time()
+    cat("Run time of global iterated particle filter: ", as.integer(round(difftime(end, start, units='mins'))), " minutes")
+  }
+)
+```
+
+### Collect and Save Results
+
+```{r}
+df_results_13 <- global_searches$collect_and_save_loglik(
+  model_search = m_global_13,
+  loglik_values = loglik_global_13,
+  out_filename = output_params_path_13,
+  reset_data = reset_data
+)
+```
+
+### Diagnostic
+
+#### Convergence
+
+```{r}
+(
+  m_global_13
+  %>% traces()
+  %>% melt()
+  %>% ggplot(
+    aes(
+      x=iteration,
+      y=value,
+      group=.L1,
+      color=factor(.L1)
+    )
+  )
+  + geom_line()
+  + guides(color="none")
+  + facet_wrap(~name, scales="free_y")
+)
+```
+
+#### Summary
+
+```{r}
+coef(m_global_13[[which.max(loglik_global_13[,1])]])
+```
+
+```{r}
+summary(df_results_13$log_lik, digits=5)
+```
+
+#### Pair plot
+
+```{r}
+#| fig-width: 10
+#| fig-asp: 1
+viz$plot_pairs(guess_points_13, df_results_13, log_lik_diff = 5)
+```
+
+#### Simulations from best model
+
+```{r}
+sims_best_13 <- (
+  global_searches$simulate_best_model(
+    m_global_13,
+    loglik_global_13,
+    nsim = Nsim
+  )
+  %>% mutate(
+    date = df_reports$date[1] + weeks(round(date * 52))
+  )
+)
+```
+
+##### Compartments
+
+```{r}
+#| fig-width: 5
+#| fig-height: 7
+
+viz$plot_compartments_sims(df_reports, sims_best_13, c("N", "S", "E", "V"))
+ggsave(
+  filename = file.path(img_dir, "compartments_sim_no_int_13.png"),
+  width = 5,
+  height = 5,
+  units = "in"
+)
+```
+
+##### Individual plots
+
+```{r}
+#| fig-width: 7
+#| fig-height: 6
+viz$plot_data_and_sample_sims(
+  df_reports,
+  target = "reports",
+  sims = sims_best_13
+)
+ggsave(
+  filename = file.path(img_dir, "ind_sim_no_int_13.png"),
+  width = 7,
+  height = 6,
+  units = "in"
+)
+```
+
+##### Aggregate plot
+
+```{r}
+#| fig-width: 10
+#| fig-height: 3
+sims_best_stats_13 <- global_searches$calculate_sim_stats(sims_best_13)
+(
+  viz$plot_data_and_summary_sims(
+    df_reports,
+    target = "reports",
+    sims = sims_best_stats_13
+  ) 
+  # + labs(title = "With interventions")
+  + theme(
+    legend.position = "right"
+  )
+  # + scale_y_continuous(limits = c(0, 210))
+  # + guides(
+  #   color = "none",
+  #   fill = "none"
+  # )
+)
+ggsave(
+  filename = file.path(img_dir, "agg_sim_no_int_13.png"),
+  width = 7,
+  height = 3,
+  units = "in"
+)
+```
+
+# Benchmarks
+
+## Negative binomial IID Model
+
+```{r}
+nb_lik <- function(tau) {
+  -sum(
+    dnbinom(
+      as.vector(obs(m_13)),
+      size = exp(tau[1]),
+      prob = exp(tau[2]),
+      log = TRUE
+    )
+  )
+}
+```
+
+```{r}
+nb_mle <- optim(c(0, -5), nb_lik)
+```
+
+```{r}
+nb_mle$par
+```
+
+```{r}
+-nb_mle$value
+```
+
+## Negative Binomial AR1
+
+```{r}
+arnb <- NegBin$arnb_fit(
+  data = as.vector(obs(m_13)),
+  start_vals = c(20, 0.5, 1),
+)
+```
+
+```{r}
+arnb$theta
+```
+
+```{r}
+arnb$ll
+```
+
+## ARMA model
+
+```{r}
+log_y <- log(as.vector(obs(m_13)) + 1)
+arma_fit <- arima(
+  log_y,
+  order=c(2, 0, 2),
+  seasonal=list(
+    order=c(1, 0, 1),
+    period=1
+  )
+)
+```
+
+```{r}
+arma_fit$loglik - sum(log_y)
+```
+
+```{r}
+arma_fit$coef
+```
+
+# Collect results
+
+```{r}
+
+lls <- list(
+  loglik_global_2[,1],
+  loglik_global_6[,1],
+  loglik_global_7[,1],
+  loglik_global_9[,1],
+  loglik_global_10[,1],
+  loglik_global_11[,1],
+  loglik_global_12[,1],
+  loglik_global_13[,1]
+)
+
+mech_models <- list(
+  m_global_2[[which.max(loglik_global_2[,1])]],
+  m_global_6[[which.max(loglik_global_6[,1])]],
+  m_global_7[[which.max(loglik_global_7[,1])]],
+  m_global_9[[which.max(loglik_global_9[,1])]],
+  m_global_10[[which.max(loglik_global_10[,1])]],
+  m_global_11[[which.max(loglik_global_11[,1])]],
+  m_global_12[[which.max(loglik_global_12[,1])]],
+  m_global_13[[which.max(loglik_global_13[,1])]]
+)
+
+model_names <- c(
+  # paste0("m_", 1:length(lls)),
+  paste0("m_", c(2, 6, 7, 9, 10, 11, 12, 13)),
+  # "nb_iid",
+  "nb_ar1",
+  "SARIMA"
+)
+
+num_params <- sapply(mech_models, function(x) length(coef(x)) - 4)
+num_params <- c(
+  num_params, 
+  # 2, 
+  3, 
+  7
+)
+lls_best <- sapply(lls, max)
+lls_best <- c(
+  lls_best, 
+  # -nb_mle$value, 
+  arnb$ll, 
+  arma_fit$loglik - sum(log_y)
+)
+aics <- -2 * lls_best + 2 * num_params
+delta_aics <- aics - min(aics)
+
+df_summary <- (
+  data.frame(
+    Model = model_names,
+    Log_Likelihood = round(lls_best),
+    Parameter_Number = num_params,
+    deltaAIC = round(delta_aics),
+    check.names = FALSE
+  )
+)
+```
+
+```{r}
+df_summary
+```
